@@ -199,10 +199,10 @@ The UI never imports or links EventKit. One long-lived `EKEventStore` lives in t
 
 ## Homebrew
 
-After the public `v1.0.0` release is published, install from the dedicated tap:
+Install the public `v1.0.0` release from the dedicated tap:
 
 ```sh
-brew tap dima/tui-calendar
+brew tap dmshvedchenko/tui-calendar
 brew install tui-calendar
 tui-calendar
 ```
@@ -217,9 +217,9 @@ tui-calendar doctor --mock
 
 Then review [Calendar permission](#calendar-permission),
 [Cache recovery](#cache-recovery), and [IPC troubleshooting](docs/ipc.md#ipc-troubleshooting-and-recovery).
-The source-tree formula at [Formula/tui-calendar.rb](Formula/tui-calendar.rb)
-is the release template mirrored by the tap. Its checksum is intentionally
-filled only after GitHub publishes the matching source archive.
+The bundled helper is native EventKit code and is installed beside the binary;
+no source-tree helper path is required. The public formula lives in the
+[Homebrew tap](https://github.com/dmshvedchenko/homebrew-tui-calendar).
 
 For a local install without Homebrew:
 

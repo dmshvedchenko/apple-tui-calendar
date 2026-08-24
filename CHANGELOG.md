@@ -8,6 +8,45 @@ All notable user-facing changes are documented here. This project follows
 First public release of Terminal Calendar, a keyboard-first macOS calendar
 client backed by Apple's EventKit.
 
+### Installation
+
+#### Homebrew (recommended)
+
+```sh
+brew tap dmshvedchenko/tui-calendar
+brew install tui-calendar
+tui-calendar
+```
+
+Terminal Calendar requires macOS Calendar permission on first launch. The
+Homebrew formula bundles the native EventKit helper beside the executable.
+
+### First run
+
+1. Allow Calendar access when macOS prompts, or enable Terminal Calendar in
+   **System Settings → Privacy & Security → Calendars**.
+2. Verify the installation and its native helper:
+
+   ```sh
+   tui-calendar doctor
+   ```
+
+3. For an offline/mock-only diagnostic, run:
+
+   ```sh
+   tui-calendar doctor --mock
+   ```
+
+### Troubleshooting
+
+- **Calendar permission:** enable Terminal Calendar in **System Settings →
+  Privacy & Security → Calendars**, then run `tui-calendar doctor` again.
+- **Helper or IPC issue:** `tui-calendar doctor` checks the executable, the
+  bundled EventKit helper, IPC connectivity, and local cache state.
+- **Cache recovery:** a corrupted cache is quarantined automatically and data
+  is reloaded from EventKit. No macOS calendar events or calendars are
+  deleted; only disposable local cache files are moved aside.
+
 ### Highlights
 
 - Native EventKit integration for configured iCloud, Google, Exchange, CalDAV,
@@ -32,5 +71,5 @@ client backed by Apple's EventKit.
 
 - Release builds package `tui-calendar` in `bin/` and the native
   `tui-calendar-service` helper in `libexec/tui-calendar/`.
-- The Homebrew formula and separate tap template are ready for checksum update
-  once the `v1.0.0` GitHub release tag is published.
+- Homebrew distribution is available through
+  `dmshvedchenko/tui-calendar`.
