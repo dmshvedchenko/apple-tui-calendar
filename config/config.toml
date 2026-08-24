@@ -1,0 +1,21 @@
+# ~/.config/tui-calendar/config.toml
+theme = "dark"
+week_start = "monday"
+time_format = "24h"
+default_view = "week"
+show_week_numbers = true
+refresh_seconds = 60
+backend = "eventkit"
+
+[event]
+default_duration_minutes = 60
+default_start_time = "09:00"
+time_rounding_minutes = 15
+move_step_minutes = 15
+
+[cache]
+past_days = 365
+future_days = 730
+
+# Usually unnecessary: tui-calendar locates an adjacent service automatically.
+# service_path = "/usr/local/bin/tui-calendar-service"

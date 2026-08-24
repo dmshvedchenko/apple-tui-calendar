@@ -1,0 +1,6 @@
+/target/
+/macos-calendar-service/.build/
+/.DS_Store
+.tmp-doctor-config.toml
+*.db-shm
+*.db-wal

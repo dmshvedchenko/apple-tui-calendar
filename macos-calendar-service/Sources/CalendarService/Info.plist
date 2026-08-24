@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>dev.tuicalendar.service</string>
+    <key>CFBundleName</key>
+    <string>Terminal Calendar</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Terminal Calendar requires access to macOS calendars.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Terminal Calendar requires access to macOS calendars to display and manage events.</string>
+</dict>
+</plist>
+
