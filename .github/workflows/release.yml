@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test Rust
+        run: cargo test --all-targets --locked
+      - name: Build Rust release binary
+        run: cargo build --release --locked
+      - name: Build Swift helper (debug)
+        working-directory: macos-calendar-service
+        run: swift build -c debug
+      - name: Build Swift helper (release)
+        working-directory: macos-calendar-service
+        run: swift build -c release
