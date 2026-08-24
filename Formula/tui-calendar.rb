@@ -5,7 +5,7 @@ class TuiCalendar < Formula
   version "1.0.0"
   # PLACEHOLDER: replace with `shasum -a 256 v1.0.0.tar.gz` after publishing
   # the v1.0.0 GitHub tag. Do not release or install this formula until then.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "0e0236393c7f41cd667c4e63fa6003f04e8fd959544315737b267ab61e900ee3"
   license "MIT"
 
   depends_on "rust" => :build
