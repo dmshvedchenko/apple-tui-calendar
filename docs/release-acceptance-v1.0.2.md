@@ -1,4 +1,4 @@
-# v1.0.1 manual acceptance
+# v1.0.2 manual acceptance
 
 Run this in Ghostty on macOS. Use `tui-calendar doctor` first; it must report
 the helper path, **FullAccess**, and `Status: healthy`. Do not use important

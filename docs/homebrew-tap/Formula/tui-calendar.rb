@@ -1,8 +1,8 @@
 class TuiCalendar < Formula
   desc "Keyboard-first Apple Calendar client for the terminal"
   homepage "https://github.com/dmshvedchenko/apple-tui-calendar"
-  url "https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.1.tar.gz"
-  # PLACEHOLDER: replace after the v1.0.1 source archive is published; do not
+  url "https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.2.tar.gz"
+  # PLACEHOLDER: replace after the v1.0.2 source archive is published; do not
   # publish this tap formula with the all-zero placeholder.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
@@ -30,7 +30,7 @@ class TuiCalendar < Formula
   end
 
   test do
-    assert_match(/^tui-calendar 1\.0\.1$/, shell_output("#{bin}/tui-calendar --version").strip)
+    assert_match(/^tui-calendar 1\.0\.2$/, shell_output("#{bin}/tui-calendar --version").strip)
     helper = libexec/"tui-calendar/tui-calendar-service"
     assert_predicate helper, :executable?
     assert_match helper.to_s, (bin/"tui-calendar").read

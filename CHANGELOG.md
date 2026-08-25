@@ -3,6 +3,17 @@
 All notable user-facing changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.2 — 2026-08-25
+
+### Fixed
+
+- Month and Agenda no longer jump back to a multi-day event's historical start
+  date when restoring selection or switching views.
+- Kept `active_date` as the authoritative navigation and view anchor across
+  Day, Week, Month, and Agenda startup and cross-view transitions.
+- Made timeline regression fixtures use local wall-clock semantics, so they
+  pass consistently in both UTC and Europe/Berlin CI environments.
+
 ## 1.0.1 — 2026-08-25
 
 ### Highlights
