@@ -44,6 +44,23 @@ make build
 
 Installed builds keep the Rust binary in `bin/` and the native helper in `libexec/tui-calendar/`. The binary resolves that runtime-relative helper automatically, so Homebrew installations do not depend on the source tree or the current working directory. `service_path` and `TUI_CALENDAR_SERVICE` remain explicit overrides for development and diagnostics.
 
+If helper discovery fails, `tui-calendar doctor` and the startup error print the
+first exact path searched. Resolution order is `service_path`,
+`TUI_CALENDAR_SERVICE`, the installed sibling `libexec` helper, the adjacent
+`target/release/tui-calendar-service` staged by `make build`, then the two
+repository development build locations.
+
+### Opt-in diagnostics
+
+Diagnostic environment variables are disabled by default. `TUI_CALENDAR_DEBUG`
+logs cache refresh lifecycle ranges; `TUI_CALENDAR_DEBUG_PIPELINE` logs
+provider/cache counts and the helper path; `TUI_CALENDAR_DEBUG_IDENTITY` logs
+duplicate occurrence-identity diagnostics; and `TUI_CALENDAR_DEBUG_UI` logs
+Agenda row construction. `TUI_CALENDAR_DEBUG_PIPELINE_DATE=YYYY-MM-DD` narrows
+pipeline event output to one day. The identity and UI diagnostics can include
+event titles and identifiers, so use them only in a private support session
+and remove them from shared logs.
+
 To explore the UI without touching Calendar data:
 
 ```sh
@@ -113,6 +130,12 @@ future_days = 730
 ```
 
 Set `backend = "mock"` for permanent demo mode. `service_path` can point to a non-adjacent native service. `TUI_CALENDAR_CONFIG`, `TUI_CALENDAR_SERVICE`, and `TUI_CALENDAR_DATA_DIR` are useful overrides for packaging and test isolation.
+
+Configuration is validated strictly before startup: unknown keys and invalid
+values report their exact field instead of silently falling back. Supported
+values are `dark` / `light` for `theme`, `monday` / `sunday` for `week_start`,
+`12h` / `24h` for `time_format`, `day` / `week` / `month` / `agenda` for
+`default_view`, and `eventkit` / `mock` for `backend`.
 
 New events use the selected event time when one is active; otherwise they use the configured day default or a rounded current time. `D` duplicates an event into the editor while deliberately dropping recurrence and attendee state. Fast move/resize shortcuts are limited to non-recurring writable events, so a series is never changed silently.
 

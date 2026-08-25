@@ -109,6 +109,7 @@ impl TimelineHitGeometry {
         if let Some(event) = self
             .event_regions
             .iter()
+            .rev()
             .find(|event| event.rect.contains(x, y))
         {
             return CalendarHitTarget::ExistingEvent {
@@ -281,6 +282,41 @@ mod tests {
             geometry.hit_test(3, 2),
             CalendarHitTarget::ExistingEvent {
                 event_id: "event-42".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn timeline_hit_testing_prefers_the_visually_topmost_event_region() {
+        let geometry = TimelineHitGeometry {
+            day_columns: vec![CalendarDayColumn {
+                date: date(10),
+                rect: ScreenRect::new(10, 4, 20, 8),
+            }],
+            all_day_area: None,
+            timed_area: ScreenRect::new(10, 4, 20, 8),
+            viewport: TimelineViewport {
+                start_minute: 8 * 60,
+                minutes_per_row: 60,
+                rows: 8,
+            },
+            // Timeline geometry is stored in paint order: background first.
+            event_regions: vec![
+                CalendarEventRegion {
+                    event_id: "multiday-background".into(),
+                    rect: ScreenRect::new(10, 4, 20, 8),
+                },
+                CalendarEventRegion {
+                    event_id: "short-foreground".into(),
+                    rect: ScreenRect::new(12, 6, 6, 2),
+                },
+            ],
+        };
+
+        assert_eq!(
+            geometry.hit_test(13, 6),
+            CalendarHitTarget::ExistingEvent {
+                event_id: "short-foreground".into(),
             }
         );
     }

@@ -294,7 +294,20 @@ impl std::fmt::Display for Availability {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
+    /// Application identity for the concrete event represented in a snapshot.
+    /// This currently mirrors the provider lookup identifier; the optional
+    /// provider/series fields below make that assumption observable during the
+    /// recurring-occurrence identity audit.
     pub id: String,
+    /// Provider identifier accepted by EventKit mutation endpoints.  It is
+    /// additive and optional so cached IPC payloads predating the diagnostic
+    /// remain readable.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Provider calendar-item/series identifier, when EventKit exposes one.
+    /// It is metadata only and is never used as a cache key by itself.
+    #[serde(default)]
+    pub series_id: Option<String>,
     pub calendar_id: String,
     pub title: String,
     pub start: DateTime<Utc>,
@@ -515,7 +528,15 @@ impl EventTimeInput {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventDraft {
+    /// EventKit lookup identifier for updates. This is deliberately not the
+    /// application occurrence identity carried by `Event::id`.
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_start: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_calendar_id: Option<String>,
     pub calendar_id: String,
     pub title: String,
     pub time: EventTimeInput,
@@ -538,6 +559,12 @@ impl<'de> Deserialize<'de> for EventDraft {
         #[serde(rename_all = "camelCase")]
         struct Wire {
             id: Option<String>,
+            #[serde(default)]
+            occurrence_id: Option<String>,
+            #[serde(default)]
+            occurrence_start: Option<DateTime<Utc>>,
+            #[serde(default)]
+            occurrence_calendar_id: Option<String>,
             calendar_id: String,
             title: String,
             #[serde(default)]
@@ -586,6 +613,9 @@ impl<'de> Deserialize<'de> for EventDraft {
         };
         Ok(Self {
             id: wire.id,
+            occurrence_id: wire.occurrence_id,
+            occurrence_start: wire.occurrence_start,
+            occurrence_calendar_id: wire.occurrence_calendar_id,
             calendar_id: wire.calendar_id,
             title: wire.title,
             time,
@@ -622,6 +652,9 @@ impl EventDraft {
         };
         Self {
             id: None,
+            occurrence_id: None,
+            occurrence_start: None,
+            occurrence_calendar_id: None,
             calendar_id,
             title: String::new(),
             time: EventTimeInput::timed(
@@ -733,6 +766,17 @@ pub struct DeleteEventRequest {
     pub event_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recurrence_scope: Option<RecurrenceMutationScope>,
+}
+
+/// Provider mutation target for a concrete occurrence. Application/cache
+/// identity remains `Event::id`; EventKit receives only its native identifier
+/// plus canonical occurrence context to disambiguate recurring instances.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EventMutationTarget {
+    pub provider_id: String,
+    pub calendar_id: String,
+    pub occurrence_start: DateTime<Utc>,
 }
 
 impl DeleteEventRequest {

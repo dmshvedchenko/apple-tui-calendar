@@ -118,6 +118,8 @@ impl MockBackend {
                 .with_timezone(&Utc);
             Event {
                 id: id.into(),
+                provider_id: Some(id.into()),
+                series_id: None,
                 calendar_id: calendar.into(),
                 title: title.into(),
                 start,
@@ -161,6 +163,8 @@ impl MockBackend {
                        end_exclusive: chrono::NaiveDate,
                        trusted_dates: bool| Event {
             id: id.into(),
+            provider_id: Some(id.into()),
+            series_id: None,
             calendar_id: "personal".into(),
             title: title.into(),
             start: start.and_hms_opt(0, 0, 0).unwrap().and_utc(),
@@ -290,6 +294,11 @@ impl MockBackend {
     #[cfg(test)]
     pub fn set_events_for_test(&self, events: Vec<Event>) {
         self.store.lock().unwrap().events = events;
+    }
+
+    #[cfg(test)]
+    pub fn notify_change_for_test(&self) {
+        let _ = self.changes.send(());
     }
 }
 
@@ -531,12 +540,16 @@ impl CalendarBackend for MockBackend {
         store.last_update_span = Some(span);
         store.last_updated_time = Some(draft.time.clone());
         store.last_update_time_mutation = Some(time_mutation.clone());
+        let occurrence_start = draft.occurrence_start;
         let slot = store
             .events
             .iter_mut()
-            .find(|event| event.id == id)
+            .find(|event| {
+                event.provider_id.as_deref() == Some(id.as_str())
+                    && occurrence_start.is_none_or(|start| event.start == start)
+            })
             .ok_or_else(|| BackendError::NotFound(id.clone()))?;
-        let mut updated = draft_to_event(draft, id);
+        let mut updated = draft_to_event(draft, slot.id.clone());
         match time_mutation {
             EventTimeMutation::Preserve => {
                 updated.start = slot.start;
@@ -565,13 +578,21 @@ impl CalendarBackend for MockBackend {
         Ok(updated)
     }
 
-    async fn delete_event(&self, id: &str, span: EventSpan) -> Result<(), BackendError> {
+    async fn delete_event(
+        &self,
+        target: crate::model::EventMutationTarget,
+        span: EventSpan,
+    ) -> Result<(), BackendError> {
         let mut store = self.store.lock().unwrap();
         store.last_delete_span = Some(span);
         let before = store.events.len();
-        store.events.retain(|event| event.id != id);
+        store.events.retain(|event| {
+            event.provider_id.as_deref() != Some(target.provider_id.as_str())
+                || event.calendar_id != target.calendar_id
+                || event.start != target.occurrence_start
+        });
         if before == store.events.len() {
-            return Err(BackendError::NotFound(id.into()));
+            return Err(BackendError::NotFound(target.provider_id));
         }
         let _ = self.changes.send(());
         Ok(())
@@ -606,6 +627,7 @@ impl CalendarBackend for MockBackend {
 }
 
 fn draft_to_event(draft: EventDraft, id: String) -> Event {
+    let provider_id = draft.id.clone().unwrap_or_else(|| id.clone());
     let (start, end, all_day, all_day_start_date, all_day_end_date_exclusive) = match draft.time {
         EventTimeInput::Timed { start, end } => (start, end, false, None, None),
         EventTimeInput::AllDay {
@@ -622,6 +644,8 @@ fn draft_to_event(draft: EventDraft, id: String) -> Event {
     };
     Event {
         id,
+        provider_id: Some(provider_id),
+        series_id: None,
         calendar_id: draft.calendar_id,
         title: draft.title,
         start,
@@ -680,7 +704,14 @@ mod tests {
                 .any(|e| e.id == created.id)
         );
         backend
-            .delete_event(&created.id, EventSpan::ThisEvent)
+            .delete_event(
+                crate::model::EventMutationTarget {
+                    provider_id: created.provider_id.clone().unwrap(),
+                    calendar_id: created.calendar_id.clone(),
+                    occurrence_start: created.start,
+                },
+                EventSpan::ThisEvent,
+            )
             .await
             .unwrap();
         assert_eq!(backend.last_delete_span(), Some(EventSpan::ThisEvent));

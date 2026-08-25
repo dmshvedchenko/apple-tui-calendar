@@ -133,9 +133,16 @@ pub struct EventKitBackend {
 
 impl EventKitBackend {
     pub async fn connect(configured_path: Option<&Path>) -> Result<Self, BackendError> {
-        let service = resolve_service(configured_path).ok_or_else(|| BackendError::Unavailable(
-            "tui-calendar-service not found; run `make swift-release` or set service_path in config.toml".into()
-        ))?;
+        let service = resolve_service(configured_path).ok_or_else(|| {
+            let searched = service_search_paths(configured_path)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            BackendError::Unavailable(format!(
+                "tui-calendar-service not found; searched {searched}; run `make swift-release` or set service_path in config.toml"
+            ))
+        })?;
         let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
         let (changes, _) = broadcast::channel(32);
         let (states, _) = broadcast::channel(16);
@@ -200,6 +207,22 @@ impl EventKitBackend {
             .map_err(|e| {
                 BackendError::Unavailable(format!("starting {}: {e}", resources.service.display()))
             })?;
+        if std::env::var_os("TUI_CALENDAR_DEBUG_PIPELINE").is_some() {
+            let metadata = std::fs::metadata(&resources.service).ok();
+            let modified = metadata
+                .and_then(|value| value.modified().ok())
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_secs().to_string())
+                .unwrap_or_else(|| "unavailable".into());
+            eprintln!(
+                "tui-calendar pipeline helper path={} mtime_unix={} parent_pid={} child_pid={} protocol=v{}",
+                resources.service.display(),
+                modified,
+                std::process::id(),
+                child.id().unwrap_or(0),
+                IPC_PROTOCOL_VERSION
+            );
+        }
         let writer = child
             .stdin
             .take()
@@ -378,17 +401,35 @@ fn legacy_update_event_payload(event: &EventDraft) -> Result<Value, BackendError
     Ok(payload)
 }
 
-pub fn resolve_service(configured: Option<&Path>) -> Option<PathBuf> {
-    let installed_helper = std::env::current_exe().ok().and_then(|executable| {
-        executable
-            .parent()
-            .and_then(Path::parent)
-            .map(|prefix| prefix.join("libexec/tui-calendar/tui-calendar-service"))
-    });
-    let candidates = [
+fn installed_service_path(executable: &Path) -> Option<PathBuf> {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join("libexec/tui-calendar/tui-calendar-service"))
+}
+
+fn sibling_development_service_path(executable: &Path) -> Option<PathBuf> {
+    executable
+        .parent()
+        .map(|parent| parent.join("tui-calendar-service"))
+}
+
+/// Ordered helper locations used by both connection and diagnostics. Keeping
+/// this list authoritative means a broken packaged install reports the exact
+/// runtime-relative path it expected, rather than a generic "not found".
+pub fn service_search_paths(configured: Option<&Path>) -> Vec<PathBuf> {
+    [
         configured.map(Path::to_path_buf),
         std::env::var_os("TUI_CALENDAR_SERVICE").map(PathBuf::from),
-        installed_helper,
+        std::env::current_exe()
+            .ok()
+            .and_then(|executable| installed_service_path(&executable)),
+        // `make build` stages the development helper beside the Rust release
+        // binary. This keeps `target/release/tui-calendar` runnable from any
+        // working directory without affecting the installed libexec layout.
+        std::env::current_exe()
+            .ok()
+            .and_then(|executable| sibling_development_service_path(&executable)),
         // Development fallback only: installed builds must use libexec above.
         Some(PathBuf::from(
             "macos-calendar-service/.build/release/tui-calendar-service",
@@ -396,8 +437,16 @@ pub fn resolve_service(configured: Option<&Path>) -> Option<PathBuf> {
         Some(PathBuf::from(
             "macos-calendar-service/.build/debug/tui-calendar-service",
         )),
-    ];
-    candidates.into_iter().flatten().find(|path| path.is_file())
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+pub fn resolve_service(configured: Option<&Path>) -> Option<PathBuf> {
+    service_search_paths(configured)
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 #[async_trait]
@@ -503,8 +552,12 @@ impl CalendarBackend for EventKitBackend {
         .await
     }
 
-    async fn delete_event(&self, id: &str, span: EventSpan) -> Result<(), BackendError> {
-        self.call("deleteEvent", json!({ "id": id, "span": span }))
+    async fn delete_event(
+        &self,
+        target: crate::model::EventMutationTarget,
+        span: EventSpan,
+    ) -> Result<(), BackendError> {
+        self.call("deleteEvent", json!({ "id": target.provider_id, "calendarId": target.calendar_id, "occurrenceStart": target.occurrence_start, "span": span }))
             .await
     }
 
@@ -588,6 +641,40 @@ mod tests {
             resolve_service(Some(temp.path())),
             Some(temp.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn homebrew_style_runtime_layout_resolves_to_the_sibling_libexec_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("bin/tui-calendar");
+        let helper = root
+            .path()
+            .join("libexec/tui-calendar/tui-calendar-service");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "binary").unwrap();
+        std::fs::write(&helper, "helper").unwrap();
+
+        assert_eq!(installed_service_path(&executable), Some(helper));
+    }
+
+    #[test]
+    fn make_build_layout_resolves_to_the_release_binary_sibling_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("target/release/tui-calendar");
+        let helper = root.path().join("target/release/tui-calendar-service");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "binary").unwrap();
+        std::fs::write(&helper, "helper").unwrap();
+
+        assert_eq!(sibling_development_service_path(&executable), Some(helper));
+    }
+
+    #[test]
+    fn helper_search_paths_preserve_an_explicit_missing_path_for_diagnostics() {
+        let configured = PathBuf::from("/missing/tui-calendar-service");
+        let paths = service_search_paths(Some(&configured));
+        assert_eq!(paths.first(), Some(&configured));
     }
 
     #[cfg(unix)]

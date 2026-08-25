@@ -3,6 +3,23 @@
 All notable user-facing changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.1 — 2026-08-25
+
+### Highlights
+
+- Fixed EventKit recurring-occurrence identity handling so distinct generated
+  occurrences are retained through cache refreshes and remain separately
+  selectable.
+- Added cache schema v3 migration support for the corrected occurrence data.
+- Polished Day, Week, Month, and Agenda presentation, including dense-event
+  readability, explicit Month overflow, and stable cross-view selection.
+- Improved Details/editor modal return behavior, keyboard discovery, Help, and
+  footer hints.
+- Hardened configuration validation, helper discovery and Homebrew runtime
+  packaging diagnostics, doctor permission health reporting, and terminal
+  cleanup after partial initialization failures.
+- Corrected public release metadata and repository-owner links.
+
 ## 1.0.0 — 2026-08-24
 
 First public release of Terminal Calendar, a keyboard-first macOS calendar

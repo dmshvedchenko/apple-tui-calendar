@@ -1,15 +1,15 @@
 mod eventkit;
 mod mock;
 
-pub use eventkit::{EventKitBackend, IPC_PROTOCOL_VERSION, resolve_service};
+pub use eventkit::{EventKitBackend, IPC_PROTOCOL_VERSION, resolve_service, service_search_paths};
 pub use mock::MockBackend;
 
 use crate::model::{
     AlarmMutation, AuthorizationStatus, CalendarCapabilities, CalendarError, CalendarInfo,
     CalendarSource, CreateCalendarRequest, CreateCalendarResponse, DeleteCalendarRequest,
-    DeleteCalendarResponse, Event, EventDraft, EventSpan, EventTimeMutation, FetchRequest,
-    InvitationResponse, RenameCalendarRequest, RenameCalendarResponse, SetCalendarColorRequest,
-    SetCalendarColorResponse,
+    DeleteCalendarResponse, Event, EventDraft, EventMutationTarget, EventSpan, EventTimeMutation,
+    FetchRequest, InvitationResponse, RenameCalendarRequest, RenameCalendarResponse,
+    SetCalendarColorRequest, SetCalendarColorResponse,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -117,7 +117,11 @@ pub trait CalendarBackend: Send + Sync {
         alarms: AlarmMutation,
         time_mutation: EventTimeMutation,
     ) -> Result<Event, BackendError>;
-    async fn delete_event(&self, id: &str, span: EventSpan) -> Result<(), BackendError>;
+    async fn delete_event(
+        &self,
+        target: EventMutationTarget,
+        span: EventSpan,
+    ) -> Result<(), BackendError>;
     async fn respond_to_invitation(
         &self,
         id: &str,
@@ -211,7 +215,7 @@ impl CalendarBackend for OfflineBackend {
     ) -> Result<Event, BackendError> {
         Err(self.error())
     }
-    async fn delete_event(&self, _: &str, _: EventSpan) -> Result<(), BackendError> {
+    async fn delete_event(&self, _: EventMutationTarget, _: EventSpan) -> Result<(), BackendError> {
         Err(self.error())
     }
     async fn respond_to_invitation(

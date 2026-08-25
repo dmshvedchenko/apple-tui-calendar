@@ -26,6 +26,16 @@ pub enum View {
     Agenda,
 }
 
+/// Who currently owns the Day/Week timeline position.  Automatic positioning
+/// is deliberately opt-in at navigation boundaries; a backend redraw must
+/// never take the viewport away from someone who has scrolled it manually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimelineViewportOwner {
+    #[default]
+    Auto,
+    Manual,
+}
+
 impl View {
     pub fn from_config(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
@@ -76,6 +86,35 @@ pub enum Mode {
 pub struct ModalFrame {
     pub current: Mode,
     pub return_to: Mode,
+}
+
+/// A short-lived, stable-ID snapshot of the current interaction context.
+/// `selected_event` remains the sole stored UI selection index; this context
+/// exists only while moving between views or replacing a snapshot, where an
+/// index cannot safely survive a different ordering or visibility window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionContext {
+    active_date: NaiveDate,
+    selected_event_id: Option<String>,
+    selected_event_date: Option<NaiveDate>,
+}
+
+/// The stable occurrence that owns a short-lived Details/editor workflow.
+///
+/// `selected_event` is intentionally still the application's only stored
+/// selection index. This anchor is needed only while a modal is open: a
+/// snapshot can reorder visible rows, and recurring EventKit mutations can
+/// replace the concrete occurrence identity. Provider identity remains here
+/// solely as canonical mutation lookup data; it is never used as UI focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InteractionContext {
+    source_view: View,
+    source_active_date: NaiveDate,
+    occurrence_id: String,
+    occurrence_local_date: NaiveDate,
+    provider_id: Option<String>,
+    calendar_id: String,
+    canonical_occurrence_start: DateTime<Utc>,
 }
 
 /// Provider-neutral intent produced by keyboard controls, the command palette,
@@ -234,6 +273,10 @@ pub enum WorkerCommand {
     SetCalendarColor(SetCalendarColorRequest),
     DeleteCalendar(DeleteCalendarRequest),
     Create(EventDraft),
+    CreateWithSession {
+        session: u64,
+        event: EventDraft,
+    },
     Update(
         EventDraft,
         EventSpan,
@@ -241,7 +284,21 @@ pub enum WorkerCommand {
         AlarmMutation,
         EventTimeMutation,
     ),
+    UpdateWithSession {
+        session: u64,
+        event: EventDraft,
+        span: EventSpan,
+        recurrence_scope: Option<RecurrenceMutationScope>,
+        alarms: AlarmMutation,
+        time_mutation: EventTimeMutation,
+    },
     Delete(String, EventSpan, Option<RecurrenceMutationScope>),
+    DeleteWithSession {
+        session: u64,
+        event_id: String,
+        span: EventSpan,
+        recurrence_scope: Option<RecurrenceMutationScope>,
+    },
     OpenUrl(String),
     EnsureRange(RangeRequest),
 }
@@ -267,6 +324,9 @@ pub enum WorkerUpdate {
     MutationSaving,
     MutationSucceeded(MutationEffect),
     MutationFailed(String),
+    MutationSavingFor(u64),
+    MutationSucceededFor(u64, MutationEffect),
+    MutationFailedFor(u64, String),
     Status(String),
     Error(String),
 }
@@ -388,6 +448,7 @@ pub struct App {
     pub calendar_sources: Vec<CalendarSource>,
     pub sidebar_visible: bool,
     pub timeline_start_minute: u16,
+    pub timeline_viewport_owner: TimelineViewportOwner,
     pub drag_session: DragSession,
     pub search_query: String,
     pub search_selected: usize,
@@ -409,6 +470,7 @@ pub struct App {
     pub palette_query: String,
     pub palette_selected: usize,
     pub detail_scroll: u16,
+    pub help_scroll: u16,
     pub syncing: bool,
     pub backend_state: BackendState,
     pub should_quit: bool,
@@ -417,6 +479,9 @@ pub struct App {
     pub visible_range: Option<RangeRequest>,
     pub visible_range_state: VisibleRangeState,
     pending_selection: Option<String>,
+    interaction_context: Option<InteractionContext>,
+    next_mutation_session: u64,
+    active_mutation_session: Option<u64>,
     pending_calendar_selection: Option<String>,
     pending_g: bool,
     undo_stack: Vec<UndoRecord>,
@@ -440,6 +505,7 @@ impl App {
             calendar_sources: vec![],
             sidebar_visible: false,
             timeline_start_minute: 7 * 60,
+            timeline_viewport_owner: TimelineViewportOwner::Auto,
             drag_session: DragSession::default(),
             search_query: String::new(),
             search_selected: 0,
@@ -458,6 +524,7 @@ impl App {
             palette_query: String::new(),
             palette_selected: 0,
             detail_scroll: 0,
+            help_scroll: 0,
             syncing: false,
             backend_state: BackendState::Starting,
             should_quit: false,
@@ -466,6 +533,9 @@ impl App {
             visible_range: None,
             visible_range_state: VisibleRangeState::Ready,
             pending_selection: None,
+            interaction_context: None,
+            next_mutation_session: 0,
+            active_mutation_session: None,
             pending_calendar_selection: None,
             pending_g: false,
             undo_stack: vec![],
@@ -487,6 +557,40 @@ impl App {
     }
 
     fn undo_record_for_command(&self, command: &WorkerCommand) -> Option<UndoRecord> {
+        match command {
+            WorkerCommand::CreateWithSession { event, .. } => {
+                return self.undo_record_for_command(&WorkerCommand::Create(event.clone()));
+            }
+            WorkerCommand::UpdateWithSession {
+                event,
+                span,
+                recurrence_scope,
+                alarms,
+                time_mutation,
+                ..
+            } => {
+                return self.undo_record_for_command(&WorkerCommand::Update(
+                    event.clone(),
+                    *span,
+                    *recurrence_scope,
+                    alarms.clone(),
+                    time_mutation.clone(),
+                ));
+            }
+            WorkerCommand::DeleteWithSession {
+                event_id,
+                span,
+                recurrence_scope,
+                ..
+            } => {
+                return self.undo_record_for_command(&WorkerCommand::Delete(
+                    event_id.clone(),
+                    *span,
+                    *recurrence_scope,
+                ));
+            }
+            _ => {}
+        }
         match command {
             WorkerCommand::Create(draft) if draft.recurrence.is_empty() => {
                 Some(UndoRecord::Created {
@@ -576,6 +680,9 @@ impl App {
         Some(ReversibleEventDraft {
             draft: EventDraft {
                 id,
+                occurrence_id: Some(event.id.clone()),
+                occurrence_start: Some(event.start),
+                occurrence_calendar_id: Some(event.calendar_id.clone()),
                 calendar_id: event.calendar_id.clone(),
                 title: event.title.clone(),
                 time,
@@ -626,7 +733,11 @@ impl App {
             return None;
         }
         let mut draft = reversible.draft.clone();
-        draft.id = Some(event.id);
+        let provider_id = event.provider_id.clone()?;
+        draft.id = Some(provider_id);
+        draft.occurrence_id = Some(event.id.clone());
+        draft.occurrence_start = Some(event.start);
+        draft.occurrence_calendar_id = Some(event.calendar_id.clone());
         Some(WorkerCommand::Update(
             draft,
             EventSpan::ThisEvent,
@@ -821,8 +932,8 @@ impl App {
                 },
             ) => {
                 *event_id = confirmed_id.clone();
-                before.draft.id = Some(confirmed_id.clone());
-                after.draft.id = Some(confirmed_id.clone());
+                before.draft.occurrence_id = Some(confirmed_id.clone());
+                after.draft.occurrence_id = Some(confirmed_id.clone());
             }
             (
                 UndoRecord::Deleted {
@@ -859,6 +970,78 @@ impl App {
         stack.push(record);
     }
 
+    /// Tags an event mutation at the UI/worker boundary. Only updates carrying
+    /// this nonce may alter the active editor: an old helper completion must
+    /// never close or overwrite a newer editor session.
+    pub fn begin_mutation_session(&mut self, command: WorkerCommand) -> WorkerCommand {
+        if !matches!(
+            &command,
+            WorkerCommand::Create(_)
+                | WorkerCommand::Update(_, _, _, _, _)
+                | WorkerCommand::Delete(_, _, _)
+        ) {
+            return command;
+        }
+        self.next_mutation_session = self.next_mutation_session.wrapping_add(1).max(1);
+        let session = self.next_mutation_session;
+        self.active_mutation_session = Some(session);
+        match command {
+            WorkerCommand::Create(event) => WorkerCommand::CreateWithSession { session, event },
+            WorkerCommand::Update(event, span, recurrence_scope, alarms, time_mutation) => {
+                WorkerCommand::UpdateWithSession {
+                    session,
+                    event,
+                    span,
+                    recurrence_scope,
+                    alarms,
+                    time_mutation,
+                }
+            }
+            WorkerCommand::Delete(event_id, span, recurrence_scope) => {
+                WorkerCommand::DeleteWithSession {
+                    session,
+                    event_id,
+                    span,
+                    recurrence_scope,
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn mutation_session_is_current(&self, session: u64) -> bool {
+        self.active_mutation_session == Some(session)
+    }
+
+    fn apply_mutation_success(&mut self, effect: MutationEffect) {
+        self.complete_history(&effect);
+        self.mutation_state = MutationState::Idle;
+        self.active_mutation_session = None;
+        self.form = None;
+        self.form_dirty = false;
+        self.pending_recurring_mutation = None;
+        self.pending_delete_event_id = None;
+        if !matches!(effect, MutationEffect::Deleted { .. }) {
+            // The backend response is authoritative, including a concrete
+            // EventKit exception ID produced by a recurring ThisEvent edit.
+            self.pending_selection = Some(effect.event_id().to_owned());
+        } else {
+            self.interaction_context = None;
+        }
+        if matches!(self.mode, Mode::Form | Mode::QuickAdd) {
+            self.close_all_modals();
+            self.interaction_context = None;
+        }
+        self.status = Some((effect.label().into(), false, Instant::now()));
+    }
+
+    fn apply_mutation_failure(&mut self, text: String) {
+        self.fail_history();
+        self.mutation_state = MutationState::Failed;
+        self.active_mutation_session = None;
+        self.status = Some((text, true, Instant::now()));
+    }
+
     fn enter_modal(&mut self, mode: Mode) {
         self.modal_stack.push(ModalFrame {
             current: mode,
@@ -891,6 +1074,76 @@ impl App {
             .unwrap_or(Mode::Normal);
     }
 
+    fn interaction_context_for(&self, event: &Event) -> InteractionContext {
+        InteractionContext {
+            source_view: self.view,
+            source_active_date: self.active_date,
+            occurrence_id: event.id.clone(),
+            occurrence_local_date: event.display_start_date(),
+            provider_id: event.provider_id.clone(),
+            calendar_id: event.calendar_id.clone(),
+            canonical_occurrence_start: event.start,
+        }
+    }
+
+    fn ensure_interaction_context(&mut self, event: &Event) {
+        if self
+            .interaction_context
+            .as_ref()
+            .is_none_or(|context| context.occurrence_id != event.id)
+        {
+            self.interaction_context = Some(self.interaction_context_for(event));
+        }
+    }
+
+    fn restore_interaction_context(&mut self) -> bool {
+        let Some((view, date, id)) = self.interaction_context.as_ref().map(|context| {
+            (
+                context.source_view,
+                context.source_active_date,
+                context.occurrence_id.clone(),
+            )
+        }) else {
+            return false;
+        };
+        self.view = view;
+        self.active_date = date;
+        self.select_visible_event_id(&id)
+    }
+
+    fn close_details(&mut self) {
+        let context = self.interaction_context.clone();
+        self.leave_modal();
+        if let Some(context) = context {
+            self.view = context.source_view;
+            self.active_date = context.source_active_date;
+            if !self.select_visible_event_id(&context.occurrence_id) {
+                self.clear_event_selection();
+            }
+        }
+        self.interaction_context = None;
+        self.detail_scroll = 0;
+    }
+
+    fn finish_editor_cancel(&mut self) {
+        self.form = None;
+        self.form_dirty = false;
+        self.mutation_state = MutationState::Idle;
+        self.pending_recurring_mutation = None;
+        self.leave_modal();
+        // A Details-origin editor returns to its still-live Details frame.
+        // A direct editor return restores the concrete occurrence to its
+        // source view and then releases the short-lived anchor.
+        if !matches!(self.mode, Mode::Details) {
+            self.finish_interaction_return();
+        }
+    }
+
+    fn finish_interaction_return(&mut self) {
+        self.restore_interaction_context();
+        self.interaction_context = None;
+    }
+
     fn close_all_modals(&mut self) {
         self.modal_stack.clear();
         self.mode = Mode::Normal;
@@ -905,12 +1158,30 @@ impl App {
             }
             WorkerUpdate::CalendarSources(sources) => self.calendar_sources = sources,
             WorkerUpdate::Snapshot(snapshot) => {
-                let details_target_id = matches!(self.mode, Mode::Details)
-                    .then(|| self.selected_event_ref().map(|event| event.id.clone()))
-                    .flatten();
+                let details_target_id = self
+                    .interaction_context
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(self.mode, Mode::Details)
+                            || self
+                                .modal_stack
+                                .iter()
+                                .any(|frame| frame.current == Mode::Details)
+                    })
+                    .map(|context| context.occurrence_id.clone())
+                    .or_else(|| {
+                        matches!(self.mode, Mode::Details)
+                            .then(|| self.selected_event_ref().map(|event| event.id.clone()))
+                            .flatten()
+                    });
                 let selected_id = self
                     .pending_selection
                     .take()
+                    .or_else(|| {
+                        self.interaction_context
+                            .as_ref()
+                            .map(|context| context.occurrence_id.clone())
+                    })
                     .or_else(|| self.selected_event_ref().map(|event| event.id.clone()));
                 let selected_calendar_id = self.pending_calendar_selection.take().or_else(|| {
                     self.snapshot
@@ -974,14 +1245,8 @@ impl App {
                         .min(self.snapshot.calendars.len().saturating_sub(1));
                 }
                 if let Some(id) = selected_id {
-                    if let Some(index) = self
-                        .visible_events()
-                        .iter()
-                        .position(|event| event.id == id)
-                    {
-                        self.selected_event = index;
-                    } else {
-                        self.clamp_selection();
+                    if !self.select_visible_event_id(&id) {
+                        self.clear_event_selection();
                         self.status =
                             Some(("Selected event was removed".into(), false, Instant::now()));
                     }
@@ -996,6 +1261,7 @@ impl App {
                     && !self.visible_events().iter().any(|event| event.id == id)
                 {
                     self.close_all_modals();
+                    self.interaction_context = None;
                     self.detail_scroll = 0;
                 }
             }
@@ -1032,25 +1298,29 @@ impl App {
             | WorkerUpdate::RangeLoaded(_)
             | WorkerUpdate::RangeFailed(_, _) => {}
             WorkerUpdate::MutationSaving => self.mutation_state = MutationState::Saving,
-            WorkerUpdate::MutationSucceeded(effect) => {
-                self.complete_history(&effect);
-                self.mutation_state = MutationState::Idle;
-                self.form = None;
-                self.form_dirty = false;
-                self.pending_recurring_mutation = None;
-                self.pending_delete_event_id = None;
-                if !matches!(effect, MutationEffect::Deleted { .. }) {
-                    self.pending_selection = Some(effect.event_id().to_owned());
-                }
-                if matches!(self.mode, Mode::Form | Mode::QuickAdd) {
-                    self.close_all_modals();
-                }
-                self.status = Some((effect.label().into(), false, Instant::now()));
+            WorkerUpdate::MutationSucceeded(effect) => self.apply_mutation_success(effect),
+            WorkerUpdate::MutationFailed(text) => self.apply_mutation_failure(text),
+            WorkerUpdate::MutationSavingFor(session)
+                if self.mutation_session_is_current(session) =>
+            {
+                self.mutation_state = MutationState::Saving;
             }
-            WorkerUpdate::MutationFailed(text) => {
-                self.fail_history();
-                self.mutation_state = MutationState::Failed;
-                self.status = Some((text, true, Instant::now()));
+            WorkerUpdate::MutationSucceededFor(session, effect)
+                if self.mutation_session_is_current(session) =>
+            {
+                self.apply_mutation_success(effect);
+            }
+            WorkerUpdate::MutationFailedFor(session, text)
+                if self.mutation_session_is_current(session) =>
+            {
+                self.apply_mutation_failure(text);
+            }
+            WorkerUpdate::MutationSavingFor(_)
+            | WorkerUpdate::MutationSucceededFor(_, _)
+            | WorkerUpdate::MutationFailedFor(_, _) => {
+                // A previous request completed after its editor was cancelled
+                // or replaced. Its provider result is still reconciled by the
+                // worker, but it cannot mutate this newer UI session.
             }
             WorkerUpdate::CalendarCreateSucceeded(calendar) => {
                 self.mutation_state = MutationState::Idle;
@@ -1209,6 +1479,55 @@ impl App {
         }
     }
 
+    /// Details are anchored to an explicit occurrence rather than whichever
+    /// visible row currently occupies `selected_event`. This matters while a
+    /// refresh reorders rows and for Month events represented behind overflow.
+    pub fn details_event_ref(&self) -> Option<&Event> {
+        let context = self.interaction_context.as_ref()?;
+        self.visible_events()
+            .into_iter()
+            .find(|event| event.id == context.occurrence_id)
+    }
+
+    fn selection_context(&self) -> SelectionContext {
+        let selected = self.selected_event_ref();
+        SelectionContext {
+            active_date: self.active_date,
+            selected_event_id: selected.map(|event| event.id.clone()),
+            selected_event_date: selected.map(Event::display_start_date),
+        }
+    }
+
+    fn select_visible_event_id(&mut self, id: &str) -> bool {
+        let Some(index) = self
+            .visible_events()
+            .iter()
+            .position(|event| event.id == id)
+        else {
+            return false;
+        };
+        self.selected_event = index;
+        true
+    }
+
+    fn clear_event_selection(&mut self) {
+        // `usize::MAX` is an intentionally out-of-range index. Keeping the
+        // existing index field avoids a parallel selection state while making
+        // `selected_event_ref()` reliably return None rather than a neighbour.
+        self.selected_event = usize::MAX;
+    }
+
+    fn restore_selection_context(&mut self, context: SelectionContext) {
+        self.active_date = context.selected_event_date.unwrap_or(context.active_date);
+        if let Some(id) = context.selected_event_id {
+            if !self.select_visible_event_id(&id) {
+                self.clear_event_selection();
+            }
+        } else {
+            self.clear_event_selection();
+        }
+    }
+
     pub fn calendar(&self, id: &str) -> Option<&CalendarInfo> {
         self.snapshot
             .calendars
@@ -1301,11 +1620,21 @@ impl App {
                 self.handle_recurring_scope(key)
             }
             Mode::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    self.leave_modal();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                        self.leave_modal();
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(8),
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(8),
+                    KeyCode::Home => self.help_scroll = 0,
+                    KeyCode::End => self.help_scroll = u16::MAX,
+                    _ => {}
                 }
                 None
             }
@@ -1337,6 +1666,11 @@ impl App {
                 else {
                     return None;
                 };
+                // Pointer and keyboard focus must resolve the same concrete
+                // occurrence before a drag is considered. A read-only event
+                // can therefore still be selected even when dragging it is
+                // correctly rejected below.
+                self.select_visible_event_id(&event_id);
                 self.start_drag_session(
                     event_id.clone(),
                     CalendarHitTarget::ExistingEvent { event_id },
@@ -1540,9 +1874,15 @@ impl App {
             }
             KeyCode::Char('r') => return self.execute_action(UserAction::Refresh),
             KeyCode::Char('R') => return self.execute_action(UserAction::RetryVisibleRange),
-            KeyCode::Char('?') => self.enter_modal(Mode::Help),
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.enter_modal(Mode::Help);
+            }
             KeyCode::Enter if self.selected_event_ref().is_some() => {
                 self.detail_scroll = 0;
+                if let Some(event) = self.selected_event_ref().cloned() {
+                    self.interaction_context = Some(self.interaction_context_for(&event));
+                }
                 self.enter_modal(Mode::Details);
             }
             _ => {}
@@ -1909,6 +2249,9 @@ impl App {
             self.mutation_state = MutationState::Saving;
             return Some(WorkerCommand::Create(EventDraft {
                 id: None,
+                occurrence_id: None,
+                occurrence_start: None,
+                occurrence_calendar_id: None,
                 calendar_id: draft.calendar_id,
                 title: draft.title,
                 time: draft.time,
@@ -1969,6 +2312,9 @@ impl App {
             self.form = Some(EventForm {
                 editor_mode: EditorMode::Create,
                 id: None,
+                occurrence_id: None,
+                occurrence_start: None,
+                occurrence_calendar_id: None,
                 title: draft.title,
                 calendar_index,
                 start,
@@ -2012,10 +2358,10 @@ impl App {
 
     fn handle_details(&mut self, key: KeyEvent) -> Option<WorkerCommand> {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.leave_modal(),
-            KeyCode::Char('e') => return self.selected_event_action(UserAction::EditEvent),
-            KeyCode::Char('D') => return self.selected_event_action(UserAction::DuplicateEvent),
-            KeyCode::Char('d') => return self.selected_event_action(UserAction::DeleteEvent),
+            KeyCode::Esc | KeyCode::Char('q') => self.close_details(),
+            KeyCode::Char('e') => return self.details_event_action(UserAction::EditEvent),
+            KeyCode::Char('D') => return self.details_event_action(UserAction::DuplicateEvent),
+            KeyCode::Char('d') => return self.details_event_action(UserAction::DeleteEvent),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1)
             }
@@ -2045,12 +2391,18 @@ impl App {
                 {
                     self.active_date = date;
                     self.view = View::Agenda;
-                    self.selected_event = self
-                        .visible_events()
-                        .iter()
-                        .position(|event| event.id == id)
-                        .unwrap_or(0);
+                    if !self.select_visible_event_id(&id) {
+                        self.clear_event_selection();
+                    }
                     if open_details {
+                        if let Some(event) = self
+                            .visible_events()
+                            .into_iter()
+                            .find(|event| event.id == id)
+                            .cloned()
+                        {
+                            self.interaction_context = Some(self.interaction_context_for(&event));
+                        }
                         self.enter_modal(Mode::Details);
                     } else {
                         self.leave_modal();
@@ -2203,9 +2555,7 @@ impl App {
                 if self.form_dirty {
                     self.enter_modal(Mode::DiscardConfirm);
                 } else {
-                    self.form = None;
-                    self.pending_recurring_mutation = None;
-                    self.leave_modal();
+                    self.finish_editor_cancel();
                 }
             }
             KeyCode::Tab | KeyCode::Down => form.next_field(),
@@ -2251,7 +2601,7 @@ impl App {
                 self.mutation_state = MutationState::Idle;
                 self.pending_recurring_mutation = None;
                 self.leave_modal();
-                self.leave_modal();
+                self.finish_editor_cancel();
             }
             KeyCode::Esc => self.leave_modal(),
             _ => {}
@@ -2265,6 +2615,9 @@ impl App {
                 self.pending_recurring_mutation = None;
                 self.pending_delete_event_id = None;
                 self.leave_modal();
+                if !matches!(self.mode, Mode::Details) {
+                    self.finish_interaction_return();
+                }
             }
             KeyCode::Enter | KeyCode::Char('y') => {
                 let id = self.pending_delete_event_id.take();
@@ -2324,10 +2677,12 @@ impl App {
             return;
         }
         if event.has_recurrence {
+            self.ensure_interaction_context(&event);
             self.pending_recurring_mutation = Some((event.id, RecurrenceMutationAction::Edit));
             self.enter_modal(Mode::RecurringEditScope);
             return;
         }
+        self.ensure_interaction_context(&event);
         self.form = Some(EventForm::from_event(&event, &self.snapshot.calendars));
         self.form_dirty = false;
         self.mutation_state = MutationState::Idle;
@@ -2350,6 +2705,7 @@ impl App {
             ));
             return;
         }
+        self.ensure_interaction_context(&event);
         self.form = Some(EventForm::duplicate_from(&event, &self.snapshot.calendars));
         self.form_dirty = false;
         self.mutation_state = MutationState::Idle;
@@ -2695,7 +3051,10 @@ impl App {
         };
         Some(WorkerCommand::Update(
             EventDraft {
-                id: Some(event.id),
+                id: event.provider_id.clone(),
+                occurrence_id: Some(event.id),
+                occurrence_start: Some(event.start),
+                occurrence_calendar_id: Some(event.calendar_id.clone()),
                 calendar_id: event.calendar_id,
                 title: event.title,
                 time,
@@ -2724,10 +3083,12 @@ impl App {
             return;
         }
         if event.has_recurrence {
+            self.ensure_interaction_context(&event);
             self.pending_recurring_mutation = Some((event.id, RecurrenceMutationAction::Delete));
             self.enter_modal(Mode::RecurringDeleteScope);
             return;
         }
+        self.ensure_interaction_context(&event);
         self.delete_span = EventSpan::ThisEvent;
         self.delete_recurrence_scope = None;
         self.pending_delete_event_id = Some(event.id.clone());
@@ -2738,6 +3099,9 @@ impl App {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.pending_recurring_mutation = None;
             self.leave_modal();
+            if !matches!(self.mode, Mode::Details) {
+                self.finish_interaction_return();
+            }
             return None;
         }
         let span = match key.code {
@@ -2796,7 +3160,7 @@ impl App {
     }
 
     fn open_detail_link(&mut self) -> Option<WorkerCommand> {
-        let event = self.selected_event_ref()?;
+        let event = self.details_event_ref()?;
         let target = if !event.url.trim().is_empty() {
             event.url.clone()
         } else if !event.location.trim().is_empty() {
@@ -2818,7 +3182,9 @@ impl App {
     fn move_selection(&mut self, delta: isize) {
         let count = self.visible_events().len();
         if count == 0 {
-            self.selected_event = 0;
+            self.clear_event_selection();
+        } else if self.selected_event >= count {
+            self.selected_event = if delta < 0 { count - 1 } else { 0 };
         } else if delta < 0 {
             self.selected_event = self.selected_event.saturating_sub(delta.unsigned_abs());
         } else {
@@ -2834,7 +3200,7 @@ impl App {
             .filter_map(|(index, event)| event.occurs_on(self.active_date).then_some(index))
             .collect::<Vec<_>>();
         let Some(first) = indices.first().copied() else {
-            self.selected_event = 0;
+            self.clear_event_selection();
             self.status = Some(("No events on the active date".into(), false, Instant::now()));
             return;
         };
@@ -2855,7 +3221,8 @@ impl App {
 
     fn navigate_date(&mut self, direction: i32) {
         self.active_date += Duration::days(direction as i64);
-        self.selected_event = 0;
+        self.clear_event_selection();
+        self.reset_timeline_viewport_if_needed();
     }
 
     fn navigate_period(&mut self, direction: i32) {
@@ -2871,12 +3238,14 @@ impl App {
             View::Week => self.active_date + Duration::days(7 * direction as i64),
             _ => self.active_date + Duration::days(direction as i64),
         };
-        self.selected_event = 0;
+        self.clear_event_selection();
+        self.reset_timeline_viewport_if_needed();
     }
 
     fn set_view(&mut self, view: View) {
+        let context = self.selection_context();
         self.view = view;
-        self.selected_event = 0;
+        self.restore_selection_context(context);
     }
 
     fn selected_event_action(
@@ -2888,6 +3257,17 @@ impl App {
             return None;
         };
         self.execute_action(action(event.id.clone()))
+    }
+
+    fn details_event_action(
+        &mut self,
+        action: impl FnOnce(String) -> UserAction,
+    ) -> Option<WorkerCommand> {
+        let Some(event) = self.details_event_ref().cloned() else {
+            self.status = Some(("Event no longer exists".into(), true, Instant::now()));
+            return None;
+        };
+        self.execute_action(action(event.id))
     }
 
     fn action_event(&mut self, id: &str) -> Option<Event> {
@@ -2933,7 +3313,8 @@ impl App {
             }
             UserAction::GoToDate(date) => {
                 self.active_date = date;
-                self.selected_event = 0;
+                self.clear_event_selection();
+                self.reset_timeline_viewport_if_needed();
                 self.close_all_modals();
                 self.status = Some((
                     format!("Loading {}…", date.format("%B %Y")),
@@ -2944,7 +3325,8 @@ impl App {
             }
             UserAction::Today => {
                 self.active_date = Local::now().date_naive();
-                self.selected_event = 0;
+                self.clear_event_selection();
+                self.reset_timeline_viewport_if_needed();
                 self.close_all_modals();
                 return Some(WorkerCommand::EnsureRange(self.visible_range_request()));
             }
@@ -2976,14 +3358,127 @@ impl App {
         None
     }
     fn clamp_selection(&mut self) {
-        self.selected_event = self
-            .selected_event
-            .min(self.visible_events().len().saturating_sub(1));
+        if self.selected_event < self.visible_events().len() {
+            return;
+        }
+        self.clear_event_selection();
     }
 
     pub fn scroll_timeline(&mut self, delta: i32) {
         let next = (i32::from(self.timeline_start_minute) + delta).clamp(0, 24 * 60 - 60);
         self.timeline_start_minute = next as u16;
+        self.timeline_viewport_owner = TimelineViewportOwner::Manual;
+    }
+
+    fn reset_timeline_viewport_if_needed(&mut self) {
+        if matches!(self.view, View::Day | View::Week) {
+            self.timeline_viewport_owner = TimelineViewportOwner::Auto;
+        }
+    }
+
+    /// Updates the automatic Day/Week viewport using the real number of
+    /// timeline rows supplied by the renderer.  Callers must not use this for
+    /// ordinary redraws when the user owns the viewport.
+    pub fn refresh_auto_timeline_viewport(&mut self, rows: u16) {
+        if self.timeline_viewport_owner == TimelineViewportOwner::Auto
+            && matches!(self.view, View::Day | View::Week)
+        {
+            self.timeline_start_minute = self.smart_timeline_start_minute_at(rows, Local::now());
+        }
+    }
+
+    /// Pure focus policy shared by Day and Week.  It bins normal timed events
+    /// into the existing 30-minute display rows, ignoring all-day events and
+    /// long background-style blocks (six hours or more).  The densest window
+    /// wins; ties retain one hour of context before the first useful event.
+    pub fn smart_timeline_start_minute_at(&self, rows: u16, now: DateTime<Local>) -> u16 {
+        const ROW_MINUTES: u16 = 30;
+        const LONG_EVENT_MINUTES: u16 = 6 * 60;
+        const ROWS_PER_DAY: usize = (crate::layout::MINUTES_PER_DAY / ROW_MINUTES) as usize;
+
+        if !matches!(self.view, View::Day | View::Week) || rows == 0 {
+            return self.timeline_start_minute;
+        }
+        let visible_rows = rows.min(ROWS_PER_DAY as u16);
+        let window_minutes = visible_rows.saturating_mul(ROW_MINUTES);
+        let max_start = crate::layout::MINUTES_PER_DAY.saturating_sub(window_minutes);
+        let (first_day, end_day) = self.view_date_range();
+        let days = (end_day - first_day).num_days().max(0) as usize;
+        let mut activity = [0_u16; ROWS_PER_DAY];
+        let mut earliest = None;
+        let mut nearby_today = None;
+        let now_day = now.date_naive();
+        let now_minute = (now.hour() * 60 + now.minute()) as u16;
+
+        for event in self.visible_events() {
+            if event.all_day {
+                continue;
+            }
+            for offset in 0..days {
+                let day = first_day + Duration::days(offset as i64);
+                let Some(item) = crate::layout::item_for_day(0, event.start, event.end, false, day)
+                else {
+                    continue;
+                };
+                if item.end_minute.saturating_sub(item.start_minute) >= LONG_EVENT_MINUTES {
+                    continue;
+                }
+                earliest = Some(
+                    earliest.map_or(item.start_minute, |value: u16| value.min(item.start_minute)),
+                );
+                let first_row = usize::from(item.start_minute / ROW_MINUTES);
+                let last_row = usize::from(item.end_minute.saturating_sub(1) / ROW_MINUTES);
+                for row in activity
+                    .iter_mut()
+                    .take(last_row.min(ROWS_PER_DAY - 1) + 1)
+                    .skip(first_row)
+                {
+                    *row = (*row).saturating_add(1);
+                }
+                if day == now_day
+                    && item.start_minute <= now_minute.saturating_add(120)
+                    && item.end_minute.saturating_add(120) >= now_minute
+                {
+                    nearby_today = Some(
+                        nearby_today
+                            .map_or(item.start_minute, |value: u16| value.min(item.start_minute)),
+                    );
+                }
+            }
+        }
+
+        // Today keeps the clock in view when an appointment is active or
+        // imminent.  Historical and future dates never consult the clock.
+        if let Some(nearby) = nearby_today {
+            let target = nearby.min(now_minute).saturating_sub(window_minutes / 3);
+            return ((target / ROW_MINUTES) * ROW_MINUTES).min(max_start);
+        }
+
+        let Some(first_useful) = earliest else {
+            return if self.active_date == now_day {
+                now_minute.saturating_sub(window_minutes / 3).min(max_start)
+            } else {
+                (9 * 60).min(max_start)
+            };
+        };
+        let preferred = first_useful.saturating_sub(60).min(max_start);
+        let window_rows = usize::from(visible_rows);
+        let max_row = usize::from(max_start / ROW_MINUTES);
+        let mut best = (0_u16, u16::MAX, 0_u16);
+        for start_row in 0..=max_row {
+            let score = activity[start_row..(start_row + window_rows).min(ROWS_PER_DAY)]
+                .iter()
+                .copied()
+                .sum::<u16>();
+            let start = (start_row as u16) * ROW_MINUTES;
+            let distance = start.abs_diff(preferred);
+            // Maximize activity, then prefer useful context above the first
+            // short appointment rather than an arbitrary midnight tie.
+            if score > best.0 || (score == best.0 && distance < best.1) {
+                best = (score, distance, start);
+            }
+        }
+        best.2
     }
 
     pub fn suggested_start_minute(&self) -> u16 {
@@ -3149,6 +3644,31 @@ impl PaletteCommand {
             Self::Week => "Week view",
             Self::Month => "Month view",
             Self::Agenda => "Agenda view",
+        }
+    }
+
+    /// The displayed equivalent keybinding, when the command has one. This
+    /// small metadata source is shared by palette presentation and Help so a
+    /// renamed command cannot quietly drift from its discovery affordances.
+    pub fn key_hint(self) -> &'static str {
+        match self {
+            Self::Today => "gg / t",
+            Self::GoToDate => "",
+            Self::NewEvent => "n",
+            Self::QuickAdd => "a",
+            Self::EditEvent => "e",
+            Self::DuplicateEvent => "D",
+            Self::DeleteEvent => "d",
+            Self::Undo => "u",
+            Self::Redo => "Ctrl-R",
+            Self::Search => "/",
+            Self::Refresh => "r",
+            Self::RetryVisibleRange => "R",
+            Self::ToggleSidebar => "c",
+            Self::Day => "gd",
+            Self::Week => "gw",
+            Self::Month => "gm",
+            Self::Agenda => "ga",
         }
     }
 
@@ -4597,6 +5117,9 @@ fn weekday_code(day: chrono::Weekday) -> &'static str {
 pub struct EventForm {
     pub editor_mode: EditorMode,
     pub id: Option<String>,
+    occurrence_id: Option<String>,
+    occurrence_start: Option<DateTime<Utc>>,
+    occurrence_calendar_id: Option<String>,
     pub title: String,
     pub calendar_index: usize,
     pub start: String,
@@ -4657,6 +5180,9 @@ impl EventForm {
         Self {
             editor_mode: EditorMode::Create,
             id: None,
+            occurrence_id: None,
+            occurrence_start: None,
+            occurrence_calendar_id: None,
             title: String::new(),
             calendar_index,
             start: start_local.format("%Y-%m-%d %H:%M").to_string(),
@@ -4702,7 +5228,10 @@ impl EventForm {
             editor_mode: EditorMode::Edit {
                 event_id: event.id.clone(),
             },
-            id: Some(event.id.clone()),
+            id: event.provider_id.clone(),
+            occurrence_id: Some(event.id.clone()),
+            occurrence_start: Some(event.start),
+            occurrence_calendar_id: Some(event.calendar_id.clone()),
             title: event.title.clone(),
             calendar_index: calendars
                 .iter()
@@ -4761,6 +5290,9 @@ impl EventForm {
             source_id: event.id.clone(),
         };
         form.id = None;
+        form.occurrence_id = None;
+        form.occurrence_start = None;
+        form.occurrence_calendar_id = None;
         form.recurrence = RecurrenceEditorState::none();
         form.weekday_selection.clear();
         form.span = EventSpan::ThisEvent;
@@ -5078,6 +5610,9 @@ impl EventForm {
         &self,
         calendars: &[CalendarInfo],
     ) -> Result<(EventDraft, EventSpan, AlarmMutation), String> {
+        if matches!(self.editor_mode, EditorMode::Edit { .. }) && self.id.is_none() {
+            return Err("Event provider identity is unavailable; refresh before editing".into());
+        }
         if self.title.trim().is_empty() {
             return Err("Title is required".into());
         }
@@ -5146,6 +5681,9 @@ impl EventForm {
         Ok((
             EventDraft {
                 id: self.id.clone(),
+                occurrence_id: self.occurrence_id.clone(),
+                occurrence_start: self.occurrence_start,
+                occurrence_calendar_id: self.occurrence_calendar_id.clone(),
                 calendar_id: calendar.id.clone(),
                 title: self.title.trim().into(),
                 time,
@@ -5428,8 +5966,12 @@ pub fn spawn_worker(
     tokio::spawn(async move {
         let mut changes = backend.subscribe_changes();
         let mut backend_states = backend.subscribe_backend_state();
+        let refresh_period = std::time::Duration::from_secs(refresh_seconds.max(5));
+        // The initial synchronize below already refreshes authoritatively.
+        // Schedule the periodic tick after one full period so it cannot race a
+        // change-notification regression test or duplicate startup I/O.
         let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(refresh_seconds.max(5)));
+            tokio::time::interval_at(tokio::time::Instant::now() + refresh_period, refresh_period);
         let mut pending_change_refresh = None::<tokio::time::Instant>;
         let _ = synchronize(
             &backend,
@@ -5514,9 +6056,20 @@ pub fn spawn_worker(
                                 Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailed(format!("Unable to save event: {error}"))); }
                             }
                         }
+                        WorkerCommand::CreateWithSession { session, event } => {
+                            let _ = updates_tx.send(WorkerUpdate::MutationSavingFor(session));
+                            match backend.create_event(event).await {
+                                Ok(created) => {
+                                    let effect = MutationEffect::Created { event_id: created.id.clone(), interval: (created.start, created.end) };
+                                    let _ = updates_tx.send(WorkerUpdate::MutationSucceededFor(session, effect.clone()));
+                                    refresh_mutation_effect(&backend, &cache, &updates_tx, &effect).await;
+                                }
+                                Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailedFor(session, format!("Unable to save event: {error}"))); }
+                            }
+                        }
                         WorkerCommand::Update(event, span, recurrence_scope, alarm_mutation, time_mutation) => {
                             let _ = updates_tx.send(WorkerUpdate::MutationSaving);
-                            let before = event.id.as_deref().and_then(|id| cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id))).map(|item| (item.start, item.end));
+                            let before = event.occurrence_id.as_deref().and_then(|id| cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id))).map(|item| (item.start, item.end));
                             match backend.update_event(event, span, alarm_mutation, time_mutation).await {
                                 Ok(updated) => {
                                     let effect = MutationEffect::Updated {
@@ -5531,10 +6084,33 @@ pub fn spawn_worker(
                                 Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailed(format!("Unable to save event: {error}"))); }
                             }
                         }
+                        WorkerCommand::UpdateWithSession { session, event, span, recurrence_scope, alarms, time_mutation } => {
+                            let _ = updates_tx.send(WorkerUpdate::MutationSavingFor(session));
+                            let before = event.occurrence_id.as_deref().and_then(|id| cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id))).map(|item| (item.start, item.end));
+                            match backend.update_event(event, span, alarms, time_mutation).await {
+                                Ok(updated) => {
+                                    let effect = MutationEffect::Updated {
+                                        event_id: updated.id.clone(),
+                                        before_interval: before.unwrap_or((updated.start, updated.end)),
+                                        after_interval: (updated.start, updated.end),
+                                        recurrence_scope,
+                                    };
+                                    let _ = updates_tx.send(WorkerUpdate::MutationSucceededFor(session, effect.clone()));
+                                    refresh_mutation_effect(&backend, &cache, &updates_tx, &effect).await;
+                                }
+                                Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailedFor(session, format!("Unable to save event: {error}"))); }
+                            }
+                        }
                         WorkerCommand::Delete(id, span, recurrence_scope) => {
                             let _ = updates_tx.send(WorkerUpdate::MutationSaving);
-                            let before = cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id)).map(|item| (item.start, item.end));
-                            match backend.delete_event(&id, span).await {
+                            let selected = cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id));
+                            let before = selected.as_ref().map(|item| (item.start, item.end));
+                            let target = selected.and_then(|event| event.provider_id.map(|provider_id| crate::model::EventMutationTarget { provider_id, calendar_id: event.calendar_id, occurrence_start: event.start }));
+                            let result = match target {
+                                Some(target) => backend.delete_event(target, span).await,
+                                None => Err(BackendError::Invalid("event provider identity is unavailable; refresh before deleting".into())),
+                            };
+                            match result {
                                 Ok(_) => {
                                     if let Some(interval) = before {
                                         let effect = MutationEffect::Deleted { event_id: id, interval, recurrence_scope };
@@ -5551,6 +6127,32 @@ pub fn spawn_worker(
                                 Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailed(format!("Unable to delete event: {error}"))); }
                             }
                         }
+                        WorkerCommand::DeleteWithSession { session, event_id: id, span, recurrence_scope } => {
+                            let _ = updates_tx.send(WorkerUpdate::MutationSavingFor(session));
+                            let selected = cache.load_snapshot().ok().and_then(|snapshot| snapshot.events.into_iter().find(|item| item.id == id));
+                            let before = selected.as_ref().map(|item| (item.start, item.end));
+                            let target = selected.and_then(|event| event.provider_id.map(|provider_id| crate::model::EventMutationTarget { provider_id, calendar_id: event.calendar_id, occurrence_start: event.start }));
+                            let result = match target {
+                                Some(target) => backend.delete_event(target, span).await,
+                                None => Err(BackendError::Invalid("event provider identity is unavailable; refresh before deleting".into())),
+                            };
+                            match result {
+                                Ok(_) => {
+                                    if let Some(interval) = before {
+                                        let effect = MutationEffect::Deleted { event_id: id, interval, recurrence_scope };
+                                        let _ = updates_tx.send(WorkerUpdate::MutationSucceededFor(session, effect.clone()));
+                                        refresh_mutation_effect(&backend, &cache, &updates_tx, &effect).await;
+                                    } else {
+                                        let _ = updates_tx.send(WorkerUpdate::MutationSucceededFor(session, MutationEffect::Deleted {
+                                            event_id: id,
+                                            interval: (Utc::now(), Utc::now() + Duration::days(1)),
+                                            recurrence_scope,
+                                        }));
+                                    }
+                                }
+                                Err(error) => { let _ = updates_tx.send(WorkerUpdate::MutationFailedFor(session, format!("Unable to delete event: {error}"))); }
+                            }
+                        }
                         WorkerCommand::OpenUrl(url) => {
                             match tokio::process::Command::new("open").arg(&url).status().await {
                                 Ok(status) if status.success() => { let _ = updates_tx.send(WorkerUpdate::Status("Opened event link".into())); }
@@ -5561,6 +6163,13 @@ pub fn spawn_worker(
                     }
                 }
                 _ = changes.recv() => {
+                    // EventKit exposes only a store-wide notification, without a
+                    // changed event or calendar identity. A refresh must therefore
+                    // override existing fetched coverage; ordinary EnsureRange
+                    // would otherwise consider a stale complete range loaded.
+                    cache_lifecycle_log(
+                        "eventkit_change received; changed_identity=unavailable refresh=scheduled delay=750ms coverage=overridden",
+                    );
                     // EventKit often emits a burst for one logical edit. Coalesce it
                     // without delaying input or an explicit refresh command.
                     pending_change_refresh = Some(tokio::time::Instant::now() + std::time::Duration::from_millis(750));
@@ -5575,6 +6184,7 @@ pub fn spawn_worker(
                     }
                 } => {
                     pending_change_refresh = None;
+                    cache_lifecycle_log("eventkit_change refresh=started scope=cache-window");
                     let _ = synchronize(&backend, &cache, &updates_tx, cache_past_days, cache_future_days).await;
                 }
                 _ = interval.tick() => { let _ = synchronize(&backend, &cache, &updates_tx, cache_past_days, cache_future_days).await; }
@@ -5583,6 +6193,12 @@ pub fn spawn_worker(
         }
     });
     (commands_tx, updates_rx)
+}
+
+fn cache_lifecycle_log(message: &str) {
+    if std::env::var_os("TUI_CALENDAR_DEBUG").is_some() {
+        eprintln!("tui-calendar cache {message}");
+    }
 }
 
 fn calendar_error_from_backend(error: BackendError) -> CalendarError {
@@ -5765,6 +6381,11 @@ async fn synchronize(
         let now = Utc::now();
         let start = now - Duration::days(i64::from(cache_past_days));
         let end = now + Duration::days(i64::from(cache_future_days));
+        cache_lifecycle_log(&format!(
+            "refresh=authoritative range=[{}, {}) fetched_ranges=overridden",
+            start.to_rfc3339(),
+            end.to_rfc3339()
+        ));
         let loader = RangeLoader::new(backend.clone(), cache.clone());
         let snapshot = loader
             .refresh_range(RangeRequest {
@@ -5777,6 +6398,7 @@ async fn synchronize(
             })
             .await?;
         let _ = updates.send(WorkerUpdate::Snapshot(snapshot));
+        cache_lifecycle_log("refresh=completed snapshot=updated");
         Ok::<(), String>(())
     }.await;
     let succeeded = result.is_ok();
@@ -5807,6 +6429,195 @@ mod tests {
             updated_at: Some(Utc::now()),
         };
         (App::new(Config::default(), snapshot), backend)
+    }
+
+    fn timeline_event(
+        template: &Event,
+        day: NaiveDate,
+        start: u16,
+        end: u16,
+        title: &str,
+    ) -> Event {
+        let mut event = template.clone();
+        event.id = format!("viewport-{title}-{start}");
+        event.title = title.into();
+        event.all_day = false;
+        event.all_day_start_date = None;
+        event.all_day_end_date_exclusive = None;
+        event.start = local_midnight(day) + Duration::minutes(i64::from(start));
+        event.end = local_midnight(day) + Duration::minutes(i64::from(end));
+        event
+    }
+
+    #[tokio::test]
+    async fn smart_timeline_focus_ignores_long_background_events() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let template = app.snapshot.events[0].clone();
+        app.snapshot.events = vec![
+            timeline_event(&template, day, 0, 24 * 60, "background"),
+            timeline_event(&template, day, 8 * 60, 17 * 60, "workday"),
+            timeline_event(&template, day, 9 * 60, 9 * 60 + 30, "QNAP"),
+            timeline_event(&template, day, 9 * 60 + 45, 10 * 60, "Stand-up"),
+            timeline_event(&template, day, 12 * 60 + 30, 13 * 60 + 30, "Music"),
+            timeline_event(&template, day, 15 * 60 + 45, 16 * 60, "Review"),
+        ];
+        app.active_date = day;
+        app.view = View::Day;
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+
+        let start = app.smart_timeline_start_minute_at(16, now);
+        assert!((7 * 60..=9 * 60).contains(&start), "start={start}");
+    }
+
+    #[tokio::test]
+    async fn smart_timeline_focus_keeps_legitimate_early_appointments() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let template = app.snapshot.events[0].clone();
+        app.snapshot.events = vec![
+            timeline_event(&template, day, 30, 60, "Early one"),
+            timeline_event(&template, day, 90, 120, "Early two"),
+            timeline_event(&template, day, 180, 210, "Early three"),
+        ];
+        app.active_date = day;
+        app.view = View::Day;
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        assert!(app.smart_timeline_start_minute_at(8, now) <= 30);
+    }
+
+    #[tokio::test]
+    async fn smart_timeline_today_can_bias_toward_an_imminent_appointment() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let template = app.snapshot.events[0].clone();
+        app.snapshot.events = vec![timeline_event(
+            &template,
+            day,
+            12 * 60 + 30,
+            13 * 60,
+            "Next",
+        )];
+        app.active_date = day;
+        app.view = View::Day;
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 27, 12, 0, 0)
+            .single()
+            .unwrap();
+        let start = app.smart_timeline_start_minute_at(8, now);
+        assert!((10 * 60..=12 * 60).contains(&start), "start={start}");
+    }
+
+    #[tokio::test]
+    async fn manual_timeline_scroll_survives_refresh_but_date_navigation_reenables_auto() {
+        let (mut app, _) = app_with_mock_events().await;
+        app.view = View::Day;
+        app.refresh_auto_timeline_viewport(12);
+        app.scroll_timeline(8 * 60);
+        let manual = app.timeline_start_minute;
+        assert_eq!(app.timeline_viewport_owner, TimelineViewportOwner::Manual);
+        app.apply_update(WorkerUpdate::Snapshot(app.snapshot.clone()));
+        app.refresh_auto_timeline_viewport(12);
+        assert_eq!(app.timeline_start_minute, manual);
+
+        app.navigate_date(1);
+        assert_eq!(app.timeline_viewport_owner, TimelineViewportOwner::Auto);
+    }
+
+    #[tokio::test]
+    async fn week_uses_the_same_smart_timeline_focus_policy() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let template = app.snapshot.events[0].clone();
+        app.snapshot.events = vec![
+            timeline_event(&template, day + Duration::days(2), 0, 24 * 60, "background"),
+            timeline_event(
+                &template,
+                day + Duration::days(2),
+                9 * 60,
+                9 * 60 + 30,
+                "Planning",
+            ),
+            timeline_event(
+                &template,
+                day + Duration::days(4),
+                15 * 60,
+                16 * 60,
+                "Review",
+            ),
+        ];
+        app.active_date = day;
+        app.view = View::Week;
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
+            .single()
+            .unwrap();
+        assert_ne!(app.smart_timeline_start_minute_at(12, now), 0);
+    }
+
+    #[tokio::test]
+    async fn eventkit_change_refreshes_a_complete_but_stale_cache_range() {
+        let backend = Arc::new(crate::backend::MockBackend::seeded());
+        let template = backend
+            .events(
+                Utc::now() - Duration::days(1),
+                Utc::now() + Duration::days(1),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| !event.all_day)
+            .unwrap();
+        let provider_events = (0..8)
+            .map(|index| {
+                let mut event = template.clone();
+                event.id = format!("change-refresh-{index}");
+                event.start = Utc::now() + Duration::minutes(10 + i64::from(index) * 30);
+                event.end = event.start + Duration::minutes(20);
+                event
+            })
+            .collect::<Vec<_>>();
+        backend.set_events_for_test(provider_events[..4].to_vec());
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().join("cache.db")).unwrap();
+        let (commands, mut updates) = spawn_worker(backend.clone(), cache.clone(), 3600, 1, 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(WorkerUpdate::Snapshot(snapshot)) = updates.recv().await
+                    && snapshot.events.len() == 4
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("initial stale snapshot must load");
+        assert!(cache.stats().unwrap().fetched_range_count > 0);
+
+        backend.set_events_for_test(provider_events);
+        backend.notify_change_for_test();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(WorkerUpdate::Snapshot(snapshot)) = updates.recv().await
+                    && snapshot.events.len() == 8
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("store change must authoritatively refresh stale coverage");
+
+        assert_eq!(cache.load_snapshot().unwrap().events.len(), 8);
+        drop(commands);
     }
 
     fn pointer(
@@ -5983,7 +6794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_recurring_selection_uses_fallback_and_closes_details() {
+    async fn removed_recurring_selection_clears_focus_and_closes_details() {
         let (mut app, _) = app_with_mock_events().await;
         let occurrences = recurring_occurrences(&app.snapshot.events[0]);
         app.snapshot.events = occurrences.clone();
@@ -5997,8 +6808,7 @@ mod tests {
             updated_at: Some(Utc::now()),
         }));
         assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.selected_event_ref().unwrap().id, "A2");
-        assert_ne!(app.selected_event_ref().unwrap().id, "A3");
+        assert!(app.selected_event_ref().is_none());
     }
 
     #[tokio::test]
@@ -6014,7 +6824,7 @@ mod tests {
             updated_at: Some(Utc::now()),
         }));
         assert!(app.selected_event_ref().is_none());
-        assert_eq!(app.selected_event, 0);
+        assert_eq!(app.selected_event, usize::MAX);
     }
 
     fn key(character: char) -> KeyEvent {
@@ -7479,6 +8289,16 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 9, 10).unwrap(),
             "search navigation must use the trusted floating start date"
         );
+        assert_eq!(
+            app.selected_event_ref().map(|event| event.id.as_str()),
+            Some("trusted-search-event")
+        );
+        let _ = app.execute_action(UserAction::ChangeView(View::Month));
+        assert_eq!(
+            app.selected_event_ref().map(|event| event.id.as_str()),
+            Some("trusted-search-event"),
+            "search activation must retain the same occurrence across a view switch"
+        );
 
         app.view = View::Day;
         app.active_date = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
@@ -8289,7 +9109,7 @@ mod tests {
             Some(WorkerCommand::EnsureRange(_))
         ));
         assert_eq!(app.active_date, start - Duration::days(1));
-        assert_eq!(app.selected_event, 0);
+        assert!(app.selected_event_ref().is_none());
         assert!(matches!(
             app.handle_key(key('l')),
             Some(WorkerCommand::EnsureRange(_))
@@ -9368,6 +10188,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cross_view_switches_preserve_the_concrete_occurrence_and_date() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let template = app.snapshot.events[0].clone();
+        let mut selected = timeline_event(&template, day, 9 * 60, 10 * 60, "selected");
+        selected.id = "occurrence-selected".into();
+        selected.provider_id = Some("shared-provider-shape".into());
+        selected.series_id = Some("shared-series".into());
+        let mut other =
+            timeline_event(&template, day + Duration::days(2), 9 * 60, 10 * 60, "other");
+        other.id = "occurrence-other".into();
+        other.provider_id = Some("shared-provider-shape".into());
+        other.series_id = Some("shared-series".into());
+        app.snapshot.events = vec![selected.clone(), other];
+        app.active_date = day;
+        app.view = View::Day;
+        app.selected_event = 0;
+
+        for view in [View::Week, View::Day, View::Agenda, View::Month, View::Day] {
+            assert!(matches!(
+                app.execute_action(UserAction::ChangeView(view)),
+                Some(WorkerCommand::EnsureRange(_))
+            ));
+            assert_eq!(
+                app.active_date, day,
+                "{view:?} must retain the occurrence date"
+            );
+            assert_eq!(
+                app.selected_event_ref().map(|event| event.id.as_str()),
+                Some("occurrence-selected"),
+                "{view:?} must retain the concrete occurrence rather than its provider/series ID"
+            );
+        }
+
+        app.timeline_start_minute = 11 * 60;
+        app.timeline_viewport_owner = TimelineViewportOwner::Manual;
+        let _ = app.execute_action(UserAction::ChangeView(View::Agenda));
+        let _ = app.execute_action(UserAction::ChangeView(View::Week));
+        assert_eq!(app.timeline_start_minute, 11 * 60);
+        assert_eq!(app.timeline_viewport_owner, TimelineViewportOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn month_hidden_selection_and_pointer_hit_restore_the_same_event_in_day() {
+        let (mut app, _) = app_with_mock_events().await;
+        let day = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let template = app.snapshot.events[0].clone();
+        app.snapshot.events = (0..10)
+            .map(|index| {
+                let mut event = timeline_event(&template, day, 9 * 60, 10 * 60, "dense");
+                event.id = format!("month-occurrence-{index}");
+                event.title = format!("Dense {index}");
+                event
+            })
+            .collect();
+        app.active_date = day;
+        app.view = View::Month;
+        app.selected_event = 9;
+        let hidden_id = app.selected_event_ref().unwrap().id.clone();
+        let Some(CalendarHitGeometry::Month(month_geometry)) =
+            crate::ui::calendar_hit_geometry(&app, ratatui::layout::Rect::new(0, 0, 120, 40))
+        else {
+            panic!("month geometry must be available");
+        };
+        assert!(
+            !month_geometry
+                .event_regions
+                .iter()
+                .any(|region| region.event_id == hidden_id),
+            "the selected occurrence is deliberately behind the overflow row"
+        );
+        let _ = app.execute_action(UserAction::ChangeView(View::Day));
+        assert_eq!(app.active_date, day);
+        assert_eq!(
+            app.selected_event_ref().map(|event| event.id.as_str()),
+            Some(hidden_id.as_str())
+        );
+
+        let Some(CalendarHitGeometry::Day(day_geometry)) =
+            crate::ui::calendar_hit_geometry(&app, ratatui::layout::Rect::new(0, 0, 160, 60))
+        else {
+            panic!("day geometry must be available");
+        };
+        let hit = day_geometry
+            .event_regions
+            .iter()
+            .find(|region| region.event_id == "month-occurrence-0")
+            .unwrap();
+        let _ = app.handle_pointer_with_hit_test(
+            PointerEvent {
+                position: Some(crate::input::PointerPosition {
+                    x: hit.rect.x,
+                    y: hit.rect.y,
+                }),
+                button: Some(crate::input::PointerButton::Primary),
+                action: PointerAction::Press,
+            },
+            Some(&CalendarHitGeometry::Day(day_geometry)),
+        );
+        let _ = app.execute_action(UserAction::ChangeView(View::Week));
+        assert_eq!(
+            app.selected_event_ref().map(|event| event.id.as_str()),
+            Some("month-occurrence-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_removal_clears_selection_instead_of_reusing_its_index() {
+        let (mut app, _) = app_with_mock_events().await;
+        app.view = View::Day;
+        let date = app.snapshot.events[0].display_start_date();
+        app.active_date = date;
+        let mut selected = app.snapshot.events[0].clone();
+        selected.id = "selected-to-remove".into();
+        let mut neighbour = selected.clone();
+        neighbour.id = "unrelated-neighbour".into();
+        neighbour.start += Duration::minutes(15);
+        neighbour.end += Duration::minutes(15);
+        app.snapshot.events = vec![selected, neighbour.clone()];
+        app.selected_event = 0;
+        app.apply_update(WorkerUpdate::BackendState(BackendState::Restarting));
+        app.apply_update(WorkerUpdate::BackendState(BackendState::Connected));
+        app.apply_update(WorkerUpdate::Snapshot(Snapshot {
+            calendars: app.snapshot.calendars.clone(),
+            events: vec![neighbour],
+            authorization: AuthorizationStatus::FullAccess,
+            updated_at: Some(Utc::now()),
+        }));
+        assert!(app.selected_event_ref().is_none());
+        assert_ne!(app.selected_event, 0);
+    }
+
+    #[tokio::test]
     async fn calendar_manager_preserves_calendar_selection_by_stable_id() {
         let backend = crate::backend::MockBackend::seeded();
         let calendars = backend.calendars().await.unwrap();
@@ -10142,8 +11095,26 @@ mod tests {
             panic!("confirmation should retain the recurring event ID and scope");
         };
         assert_eq!(id, "mock-standup");
+        let event = backend
+            .events(
+                Utc::now() - Duration::days(7),
+                Utc::now() + Duration::days(7),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == id)
+            .unwrap();
         backend
-            .delete_event(&id, EventSpan::ThisEvent)
+            .delete_event(
+                crate::model::EventMutationTarget {
+                    provider_id: event.provider_id.unwrap(),
+                    calendar_id: event.calendar_id,
+                    occurrence_start: event.start,
+                },
+                EventSpan::ThisEvent,
+            )
             .await
             .unwrap();
         assert_eq!(backend.last_delete_span(), Some(EventSpan::ThisEvent));
@@ -10205,5 +11176,125 @@ mod tests {
         assert_eq!(app.mode, Mode::Form);
         assert_eq!(app.form.as_ref().unwrap().span, EventSpan::ThisEvent);
         assert!(app.pending_recurring_mutation.is_none());
+    }
+
+    #[tokio::test]
+    async fn details_anchor_survives_row_changes_and_close_restores_the_occurrence() {
+        let (mut app, _) = app_with_mock_events().await;
+        let original_id = app.selected_event_ref().unwrap().id.clone();
+        app.view = View::Day;
+        app.timeline_start_minute = 11 * 60;
+        app.timeline_viewport_owner = TimelineViewportOwner::Manual;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Details);
+
+        // A refresh can reorder the stored selection index while Details is
+        // open. Its action must still resolve the anchored occurrence.
+        app.selected_event = 1;
+        assert_eq!(app.details_event_ref().unwrap().id, original_id);
+        app.handle_key(key('e'));
+        assert_eq!(
+            app.pending_recurring_mutation
+                .as_ref()
+                .map(|(id, _)| id.as_str()),
+            Some(original_id.as_str())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Details);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selected_event_ref().unwrap().id, original_id);
+        assert_eq!(app.timeline_start_minute, 11 * 60);
+        assert_eq!(app.timeline_viewport_owner, TimelineViewportOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn duplicate_cancel_returns_to_details_with_the_original_occurrence() {
+        let (mut app, _) = app_with_mock_events().await;
+        app.selected_event = app
+            .visible_events()
+            .iter()
+            .position(|event| !event.has_recurrence)
+            .unwrap();
+        let original_id = app.selected_event_ref().unwrap().id.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Form);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Details);
+        assert_eq!(app.details_event_ref().unwrap().id, original_id);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.selected_event_ref().unwrap().id, original_id);
+    }
+
+    #[tokio::test]
+    async fn stale_mutation_completion_cannot_close_a_newer_editor_session() {
+        let (mut app, _) = app_with_mock_events().await;
+        let first = app.snapshot.events[0].clone();
+        let second = app.snapshot.events[1].clone();
+        app.begin_edit_event(first);
+        let first_command = app.begin_mutation_session(WorkerCommand::Create(EventDraft::new(
+            "work".into(),
+            app.active_date,
+        )));
+        let WorkerCommand::CreateWithSession {
+            session: first_session,
+            ..
+        } = first_command
+        else {
+            panic!("event mutation must receive a session");
+        };
+
+        app.begin_edit_event(second.clone());
+        let second_command = app.begin_mutation_session(WorkerCommand::Create(EventDraft::new(
+            second.calendar_id.clone(),
+            app.active_date,
+        )));
+        let WorkerCommand::CreateWithSession {
+            session: second_session,
+            ..
+        } = second_command
+        else {
+            panic!("event mutation must receive a session");
+        };
+        assert_ne!(first_session, second_session);
+
+        app.apply_update(WorkerUpdate::MutationSucceededFor(
+            first_session,
+            MutationEffect::Created {
+                event_id: "stale-created".into(),
+                interval: (second.start, second.end),
+            },
+        ));
+        assert_eq!(app.mode, Mode::Form);
+        assert_eq!(app.form.as_ref().unwrap().title, second.title);
+        assert_eq!(app.active_mutation_session, Some(second_session));
+    }
+
+    #[test]
+    fn help_is_modal_scrollable_and_does_not_leak_normal_mode_actions() {
+        let mut app = App::new(Config::default(), Snapshot::default());
+        app.handle_key(key('?'));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_key(key('j'));
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(app.help_scroll >= 9);
+        // `n` is a normal-mode command, not a Help action.
+        app.handle_key(key('n'));
+        assert_eq!(app.mode, Mode::Help);
+        assert!(app.form.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.help_scroll, u16::MAX);
+        app.handle_key(key('?'));
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn palette_key_hints_match_effective_keyboard_actions() {
+        assert_eq!(PaletteCommand::NewEvent.key_hint(), "n");
+        assert_eq!(PaletteCommand::Search.key_hint(), "/");
+        assert_eq!(PaletteCommand::Day.key_hint(), "gd");
+        assert_eq!(PaletteCommand::RetryVisibleRange.key_hint(), "R");
     }
 }

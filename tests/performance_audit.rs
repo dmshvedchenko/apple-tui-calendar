@@ -51,6 +51,8 @@ fn events(count: usize) -> Vec<Event> {
                 .and_utc();
             Event {
                 id: format!("audit-{index}"),
+                provider_id: Some(format!("audit-{index}")),
+                series_id: None,
                 calendar_id: "audit".into(),
                 title: format!("Audit event {index}"),
                 start,

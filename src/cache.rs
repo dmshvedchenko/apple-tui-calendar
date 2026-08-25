@@ -1,10 +1,10 @@
 use crate::model::{AuthorizationStatus, CalendarInfo, Event, Snapshot};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Files preserved after a positively identified local SQLite corruption.
 /// EventKit is never involved in this recovery; a replacement cache starts
@@ -319,6 +319,19 @@ impl Cache {
                  PRAGMA user_version=2;",
             )?;
         }
+        if version < 3 {
+            // v2 stored EventKit's provider identifier as the primary key.
+            // Recurring providers may reuse it for many concrete occurrences,
+            // so those rows cannot be migrated without guessing an occurrence
+            // identity. EventKit is authoritative: clear only disposable event
+            // rows and coverage, retaining calendar metadata and user-enabled
+            // visibility settings for the ordinary startup refresh.
+            let transaction = conn.transaction()?;
+            transaction.execute("DELETE FROM events", [])?;
+            transaction.execute("DELETE FROM fetched_ranges", [])?;
+            transaction.execute_batch("PRAGMA user_version=3;")?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -371,6 +384,36 @@ impl Cache {
                 authorization: auth,
                 updated_at,
             })
+        })
+    }
+
+    /// Reads the event rows currently persisted in SQLite that intersect a
+    /// diagnostic day. This is intentionally read-only and evaluates trusted
+    /// all-day membership from the serialized provider date range rather than
+    /// inferring it from compatibility instants.
+    pub fn events_intersecting_diagnostic_day(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        start_date: NaiveDate,
+        end_date_exclusive: NaiveDate,
+    ) -> Result<Vec<Event>> {
+        self.with_connection(|conn| {
+            let mut statement =
+                conn.prepare("SELECT raw_json FROM events ORDER BY starts_at, title")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .map(|row| -> Result<Option<Event>> {
+                    let event: Event = serde_json::from_str(&row?)?;
+                    let intersects = if event.all_day_date_range().is_some() {
+                        event.all_day_intersects_dates(start_date, end_date_exclusive)
+                    } else {
+                        event.start < end && event.end > start
+                    };
+                    Ok(intersects.then_some(event))
+                })
+                .filter_map(|row| row.transpose())
+                .collect()
         })
     }
 
@@ -630,6 +673,8 @@ mod tests {
     fn event(title: &str) -> Event {
         Event {
             id: "event-1".into(),
+            provider_id: Some("event-1".into()),
+            series_id: None,
             calendar_id: "cal-1".into(),
             title: title.into(),
             start: "2026-08-21T09:00:00Z".parse().unwrap(),
@@ -669,19 +714,64 @@ mod tests {
             enabled: true,
         };
         cache.save_calendars(&[calendar]).unwrap();
-        let e = event("Architecture review");
+        let events = (0..10)
+            .map(|index| {
+                let mut event = event(&format!("Architecture review {index}"));
+                event.id = format!("event-{index}");
+                event
+            })
+            .collect::<Vec<_>>();
         cache
             .replace_events(
                 "2026-01-01T00:00:00Z".parse().unwrap(),
                 "2027-01-01T00:00:00Z".parse().unwrap(),
-                &[e],
+                &events,
             )
             .unwrap();
         let snapshot = cache.load_snapshot().unwrap();
-        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events.len(), 10);
+        assert_eq!(cache.search("migration berlin", 10).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn diagnostic_day_query_reads_timed_and_trusted_all_day_rows_without_guessing_dates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path().join("cache.db")).unwrap();
+        let mut timed = event("Timed");
+        timed.id = "timed".into();
+        timed.start = "2026-08-27T08:00:00Z".parse().unwrap();
+        timed.end = "2026-08-27T09:00:00Z".parse().unwrap();
+        let mut all_day = event("All day");
+        all_day.id = "all-day".into();
+        all_day.all_day = true;
+        all_day.all_day_start_date = Some(NaiveDate::from_ymd_opt(2026, 8, 27).unwrap());
+        all_day.all_day_end_date_exclusive = Some(NaiveDate::from_ymd_opt(2026, 8, 28).unwrap());
+        // Compatibility instants intentionally fall outside the diagnostic
+        // transport day, so this proves the query uses trusted date identity.
+        all_day.start = "2026-08-26T00:00:00Z".parse().unwrap();
+        all_day.end = "2026-08-26T23:59:59Z".parse().unwrap();
+        cache
+            .replace_events(
+                "2026-08-01T00:00:00Z".parse().unwrap(),
+                "2026-09-01T00:00:00Z".parse().unwrap(),
+                &[timed, all_day],
+            )
+            .unwrap();
+
+        let events = cache
+            .events_intersecting_diagnostic_day(
+                "2026-08-27T00:00:00Z".parse().unwrap(),
+                "2026-08-28T00:00:00Z".parse().unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 27).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 28).unwrap(),
+            )
+            .unwrap();
         assert_eq!(
-            cache.search("migration berlin", 10).unwrap()[0].title,
-            "Architecture review"
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["all-day", "timed"]
         );
     }
 
@@ -771,7 +861,7 @@ mod tests {
         Cache::open(&path).unwrap();
         Connection::open(&path)
             .unwrap()
-            .execute_batch("PRAGMA user_version=3;")
+            .execute_batch("PRAGMA user_version=4;")
             .unwrap();
 
         let error = Cache::open_with_recovery(&path).unwrap_err();
@@ -1011,5 +1101,38 @@ mod tests {
         assert_eq!(snapshot.calendars.len(), 1);
         assert_eq!(snapshot.calendars[0].id, "cal-remaining");
         assert!(snapshot.events.is_empty());
+    }
+
+    #[test]
+    fn broad_refresh_keeps_each_recurring_occurrence_with_a_shared_provider_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path().join("cache.db")).unwrap();
+        let start: DateTime<Utc> = "2026-08-20T00:00:00Z".parse().unwrap();
+        let end: DateTime<Utc> = "2026-09-11T00:00:00Z".parse().unwrap();
+        let events = [0_i64, 1, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]
+            .into_iter()
+            .map(|offset| {
+                let mut occurrence = event("Dev Stand-up");
+                occurrence.provider_id = Some("dev-provider".into());
+                occurrence.series_id = Some("dev-series".into());
+                occurrence.has_recurrence = true;
+                occurrence.start =
+                    start + chrono::Duration::days(offset) + chrono::Duration::hours(7);
+                occurrence.end = occurrence.start + chrono::Duration::minutes(15);
+                occurrence.id = format!("occ-v1:dev-provider:{:020}", occurrence.start.timestamp());
+                occurrence
+            })
+            .collect::<Vec<_>>();
+        cache.replace_events(start, end, &events).unwrap();
+        let snapshot = cache.load_snapshot().unwrap();
+        assert_eq!(snapshot.events.len(), events.len());
+        assert_eq!(cache.stats().unwrap().event_count as usize, events.len());
+        assert!(snapshot.events.iter().any(|event| {
+            event.start == "2026-08-27T07:00:00Z".parse::<DateTime<Utc>>().unwrap()
+                && event.provider_id.as_deref() == Some("dev-provider")
+        }));
+        // Replaying the same broad authoritative response is idempotent.
+        cache.replace_events(start, end, &events).unwrap();
+        assert_eq!(cache.stats().unwrap().event_count as usize, events.len());
     }
 }

@@ -4,9 +4,11 @@
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, `↓` / `↑` | Select next / previous event |
-| `h` / `l`, `←` / `→` | Previous / next day, week, or month |
-| `gg` | Jump to today |
+| Day / Agenda: `j` / `k`, `↓` / `↑` | Select next / previous event |
+| Week: `j` / `k` | Previous / next week |
+| `h` / `l`, `←` / `→` | Previous / next calendar day |
+| `H` / `L` | Previous / next view period |
+| `gg` / `t` | Jump to today |
 | `gd` | Day view |
 | `gw` | Week view |
 | `gm` | Month view |
@@ -63,7 +65,7 @@ deletes **This occurrence**, `2` applies to **This and future events**, and
 | Key | Action |
 | --- | --- |
 | `c` | Toggle/focus the calendar sidebar |
-| `gc` | Open the read-only Calendar Manager |
+| `gc` | Open Calendar Manager |
 | `:` | Command palette |
 | `Space` | Show / hide the selected calendar |
 | `/` | Global search |
@@ -85,11 +87,38 @@ sidebar. Event mutations reuse their normal editor, recurring-scope, and
 confirmation flows. Entries that need a selected writable event remain visible
 but disabled with a reason; `Enter` never bypasses those protections.
 
+Palette rows show the effective equivalent key when one exists. The palette,
+keyboard, and Details actions all invoke the same `UserAction` workflow;
+disabled rows are informational and cannot execute.
+
+## In-app Help and context hints
+
+Press `?` in normal calendar browsing to open the scrollable Help overlay.
+Use `j` / `k` or arrows to scroll, `PageUp` / `PageDown` to move a page,
+`Home` / `End` to jump, and `?`, `Esc`, or `q` to return. The bottom bar is
+context-specific: an editor shows save/cancel/navigation controls, Search shows
+result controls, Details shows event actions, and the calendar sidebar shows
+visibility controls. Day and Week show timeline scrolling only where it works;
+Month and Agenda do not advertise it.
+
+Transient errors take priority over range/backend state; range failures and
+reconnect/permission/protocol states take priority over success confirmations;
+success confirmations then return to the contextual key hints. At narrow widths
+secondary context is omitted before the primary hint set, and strings are
+truncated by terminal display width.
+
 Overlays retain their caller context. `Esc` cancels a child overlay and returns
 to its immediate parent—for example, Command Palette → Go to date → `Esc`
 returns to the palette, and Event Details → Edit → `Esc` returns to the same
 details view with its selection and scroll position intact. A dirty editor
 still opens the existing discard prompt; `Esc` there returns to the editor.
+
+Details and editor workflows retain a short-lived concrete occurrence anchor.
+The anchor uses the displayed event's stable `Event.id` for UI focus, while
+provider ID, calendar ID, and the canonical occurrence start remain mutation
+lookup data only. Snapshot refreshes and reconnects therefore restore the same
+occurrence rather than a row at the old numeric index. A late mutation response
+is scoped to the editor session that started it and cannot close a newer form.
 
 ## UI action dispatch
 

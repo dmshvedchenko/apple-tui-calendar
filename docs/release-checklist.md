@@ -1,44 +1,44 @@
-# v1.0.0 release checklist
+# v1.0.1 final release gate
 
-This checklist releases Terminal Calendar without changing Calendar data or
-requiring a real account mutation.
+Versions are independent: application **1.0.1**, IPC protocol **v2**, cache
+schema **v3**.
 
-## Before release
+## Before publication
 
-- [ ] Confirm `git status --short` is empty in the real repository checkout.
-- [ ] Confirm `Cargo.toml` and `Cargo.lock` report `1.0.0`.
-- [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo clippy --all-targets --all-features --locked -- -D warnings`.
-- [ ] Run `cargo test --all-targets --locked`.
-- [ ] Run `cargo build --release --locked`.
-- [ ] Run `swift build -c debug` and `swift build -c release` from
-  `macos-calendar-service/`.
-- [ ] Run `target/release/tui-calendar doctor --mock`.
-- [ ] Run the release binary from a disposable install prefix and verify that
-  `doctor` reports its runtime-relative `libexec/tui-calendar/tui-calendar-service`.
-- [ ] Review `CHANGELOG.md`, `README.md`, and `docs/ipc.md` for public-facing
-  accuracy.
+- [ ] `cargo fmt --check`
+- [ ] `cargo clippy --locked --all-targets -- -D warnings`
+- [ ] `cargo test --all-targets --locked` (includes IPC and PTY tests)
+- [ ] `make debug` (Swift debug build)
+- [ ] `make swift-release` (Swift release build)
+- [ ] `cargo build --release --locked`
+- [ ] `target/release/tui-calendar --version` reports `tui-calendar 1.0.1`
+- [ ] Run [manual acceptance](release-acceptance-v1.0.1.md).
+- [ ] Run a disposable staged-install test: `bin/tui-calendar` plus `libexec/tui-calendar/tui-calendar-service`.
+- [ ] Verify repository owner/URLs are `dmshvedchenko/apple-tui-calendar`.
+- [ ] Confirm `git status --short` only contains intended release changes.
 
-## Release
+## Archive and Homebrew finalization (post-tag only)
 
-- [ ] Commit the release engineering changes.
-- [ ] Create and push the signed `v1.0.0` tag.
-- [ ] Wait for the GitHub release workflow to complete its Rust and Swift
-  builds.
-- [ ] Create the GitHub release using the `1.0.0` section of `CHANGELOG.md`.
-- [ ] Download the GitHub source archive and calculate its SHA-256.
-- [ ] Replace the Homebrew formula checksum placeholder with that exact value.
-- [ ] Copy the finalized formula to the `homebrew-tui-calendar` tap repository
-  and publish the tap update.
+1. Create and publish the final `v1.0.1` GitHub tag/release. The source archive
+   used by the template is named `v1.0.1.tar.gz` and has this URL:
 
-## After release
+   ```sh
+   https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.1.tar.gz
+   ```
 
-- [ ] `brew tap <OWNER>/tui-calendar && brew install tui-calendar` on a clean
-  macOS environment.
-- [ ] Run `tui-calendar doctor --mock` from the Homebrew installation.
-- [ ] Run `tui-calendar doctor` and verify helper discovery without creating or
-  editing a calendar.
-- [ ] Verify first-launch Calendar permission instructions and denied-access
-  offline behavior.
-- [ ] Verify cache recovery by following the documented non-destructive
-  quarantine procedure.
+2. Download that exact archive and calculate its macOS checksum:
+
+   ```sh
+   curl -L -o v1.0.1.tar.gz \
+     https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.1.tar.gz
+   shasum -a 256 v1.0.1.tar.gz
+   ```
+
+3. Replace the all-zero `sha256` placeholder in
+   `docs/homebrew-tap/Formula/tui-calendar.rb`, copy the finalized formula to
+   `dmshvedchenko/homebrew-tui-calendar`, then run `brew style` and
+   `brew audit --strict --formula dmshvedchenko/tui-calendar/tui-calendar`.
+
+4. On a clean macOS environment: tap/install, verify `tui-calendar --version`,
+   run `tui-calendar doctor`, then launch the application. Do not publish/push
+   this repository or the tap as part of the release-candidate preparation.

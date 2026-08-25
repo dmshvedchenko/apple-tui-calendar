@@ -6,7 +6,7 @@ use std::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub theme: String,
     pub week_start: String,
@@ -21,7 +21,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EventConfig {
     pub default_duration_minutes: u16,
     pub default_start_time: String,
@@ -30,7 +30,7 @@ pub struct EventConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub past_days: u32,
     pub future_days: u32,
@@ -96,11 +96,11 @@ impl Config {
         }
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Self =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let config: Self = toml::from_str(&text)
+            .map_err(|error| anyhow::anyhow!("parsing {}: {error}", path.display()))?;
         config
             .validate()
-            .with_context(|| format!("validating {}", path.display()))?;
+            .map_err(|error| anyhow::anyhow!("validating {}: {error:#}", path.display()))?;
         Ok(config)
     }
 
@@ -123,6 +123,42 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.theme.to_ascii_lowercase().as_str(), "dark" | "light"),
+            "theme must be either \"dark\" or \"light\""
+        );
+        anyhow::ensure!(
+            matches!(
+                self.week_start.to_ascii_lowercase().as_str(),
+                "monday" | "sunday"
+            ),
+            "week_start must be either \"monday\" or \"sunday\""
+        );
+        anyhow::ensure!(
+            matches!(
+                self.time_format.to_ascii_lowercase().as_str(),
+                "12h" | "24h"
+            ),
+            "time_format must be either \"12h\" or \"24h\""
+        );
+        anyhow::ensure!(
+            matches!(
+                self.default_view.to_ascii_lowercase().as_str(),
+                "day" | "week" | "month" | "agenda"
+            ),
+            "default_view must be one of \"day\", \"week\", \"month\", or \"agenda\""
+        );
+        anyhow::ensure!(
+            matches!(
+                self.backend.to_ascii_lowercase().as_str(),
+                "eventkit" | "mock"
+            ),
+            "backend must be either \"eventkit\" or \"mock\""
+        );
+        anyhow::ensure!(
+            self.refresh_seconds > 0,
+            "refresh_seconds must be greater than zero"
+        );
         anyhow::ensure!(
             self.event.default_duration_minutes > 0,
             "event.default_duration_minutes must be greater than zero"
@@ -175,6 +211,50 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("validating")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_and_invalid_top_level_settings_with_field_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "week_start = \"friday\"\n").unwrap();
+        assert!(
+            Config::load_from(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("week_start")
+        );
+
+        fs::write(&path, "unknown_release_setting = true\n").unwrap();
+        assert!(
+            Config::load_from(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_settings_instead_of_silently_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "default_view = \"timeline\"\n").unwrap();
+        let error = format!("{:#}", Config::load_from(&path).unwrap_err());
+        assert!(error.contains("default_view"));
+
+        fs::write(&path, "time_format = \"military\"\n").unwrap();
+        assert!(format!("{:#}", Config::load_from(&path).unwrap_err()).contains("time_format"));
+
+        fs::write(&path, "refresh_seconds = 0\n").unwrap();
+        assert!(format!("{:#}", Config::load_from(&path).unwrap_err()).contains("refresh_seconds"));
+
+        fs::write(&path, "[event]\nunknown_event_setting = 1\n").unwrap();
+        assert!(
+            Config::load_from(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
         );
     }
 }

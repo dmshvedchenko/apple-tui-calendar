@@ -378,22 +378,41 @@ final class CalendarService: @unchecked Sendable {
         return eventJSON(event)
     }
 
+    private func mutationEvent(_ params: [String: Any]) throws -> EKEvent {
+        guard let id = params["id"] as? String,
+              let calendarID = params["calendarId"] as? String,
+              let occurrenceStart = date(params["occurrenceStart"]),
+              let calendar = store.calendar(withIdentifier: calendarID) else {
+            throw ServiceFailure("notFound", "event mutation target is unavailable")
+        }
+        let predicate = store.predicateForEvents(
+            withStart: occurrenceStart.addingTimeInterval(-1),
+            end: occurrenceStart.addingTimeInterval(1),
+            calendars: [calendar]
+        )
+        guard let event = store.events(matching: predicate).first(where: {
+            $0.eventIdentifier == id && abs($0.startDate.timeIntervalSince(occurrenceStart)) < 0.001
+        }) else {
+            throw ServiceFailure("notFound", "event occurrence is unavailable")
+        }
+        return event
+    }
+
     private func updateEvent(_ params: [String: Any]) throws -> [String: Any] {
         guard let input = params["event"] as? [String: Any], let id = input["id"] as? String else {
             throw ServiceFailure("invalid", "missing event id")
         }
-        guard let event = store.event(withIdentifier: id) else {
-            throw ServiceFailure("notFound", id)
-        }
+        var target = input
+        target["id"] = id
+        target["calendarId"] = input["occurrenceCalendarId"] ?? input["calendarId"]
+        let event = try mutationEvent(target)
         try apply(input, to: event, creating: false, alarmMutation: params["alarmMutation"] as? [String: Any], timeMutation: params["timeMutation"] as? [String: Any])
         try store.save(event, span: span(params["span"]), commit: true)
         return eventJSON(event)
     }
 
     private func deleteEvent(_ params: [String: Any]) throws -> NSNull {
-        guard let id = params["id"] as? String, let event = store.event(withIdentifier: id) else {
-            throw ServiceFailure("notFound", params["id"] as? String ?? "missing event id")
-        }
+        let event = try mutationEvent(params)
         try store.remove(event, span: span(params["span"]), commit: true)
         return NSNull()
     }
@@ -542,8 +561,31 @@ final class CalendarService: @unchecked Sendable {
 
     private func eventJSON(_ event: EKEvent) -> [String: Any] {
         let attendees = (event.attendees ?? []).map(participantJSON)
+        // EventKit shares `eventIdentifier` across occurrences for some
+        // providers. A concrete recurring occurrence therefore needs a
+        // separate app/cache key. Length-prefixing makes arbitrary provider
+        // strings unambiguous; the canonical UTC start (or trusted floating
+        // all-day date) makes the identity deterministic across restarts.
+        let providerID = event.eventIdentifier ?? event.calendarItemIdentifier
+        let allDayDates = event.isAllDay
+            ? normalizedAllDayDateRange(start: event.startDate, end: event.endDate, calendar: Calendar.current)
+            : nil
+        let occurrencePart = allDayDates?.startDate ?? iso.string(from: event.startDate)
+        let occurrenceID: String
+        if event.hasRecurrenceRules {
+            let parts = [providerID, event.calendar.calendarIdentifier, event.isAllDay ? "d" : "t", occurrencePart]
+            occurrenceID = "occ-v1:" + parts.map { "\($0.utf8.count):\($0)" }.joined()
+        } else {
+            occurrenceID = providerID
+        }
         var result: [String: Any] = [
-            "id": event.eventIdentifier ?? event.calendarItemIdentifier,
+            // `id` preserves the established mutation-lookup wire value.  The
+            // two additive fields below let the Rust diagnostic distinguish an
+            // occurrence identifier from its calendar-item/series identity
+            // without changing any EventKit mutation behavior.
+            "id": occurrenceID,
+            "providerId": providerID,
+            "seriesId": event.calendarItemIdentifier,
             "calendarId": event.calendar.calendarIdentifier,
             "title": event.title ?? "(Untitled)",
             "start": iso.string(from: event.startDate),
@@ -562,12 +604,7 @@ final class CalendarService: @unchecked Sendable {
             "isDetached": event.isDetached,
             "invitationStatus": attendees.first(where: { ($0["isCurrentUser"] as? Bool) == true })?["status"] as? String ?? "unknown"
         ]
-        if event.isAllDay,
-           let dates = normalizedAllDayDateRange(
-               start: event.startDate,
-               end: event.endDate,
-               calendar: Calendar.current
-           ) {
+        if let dates = allDayDates {
             result["allDayStartDate"] = dates.startDate
             result["allDayEndDateExclusive"] = dates.endDateExclusive
         }

@@ -1,10 +1,10 @@
 [package]
 name = "tui-calendar"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A keyboard-first macOS Calendar client for the terminal"
 license = "MIT"
-repository = "https://github.com/dima/apple-tui-calendar"
+repository = "https://github.com/dmshvedchenko/apple-tui-calendar"
 
 [dependencies]
 anyhow = "1.0"
@@ -23,6 +23,7 @@ thiserror = "2.0"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time"] }
 toml = "0.9"
 uuid = { version = "1.18", features = ["v4", "serde"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3.21"
