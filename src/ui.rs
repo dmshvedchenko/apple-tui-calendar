@@ -3256,8 +3256,27 @@ mod tests {
         hit_test::CalendarHitTarget,
         model::{Event, Snapshot},
     };
+    use chrono::{NaiveDate, NaiveDateTime, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// Timeline geometry intentionally follows the user's local calendar. A
+    /// fixture therefore starts from local wall-clock text and derives its UTC
+    /// provider instant through the same local zone the renderer uses. This
+    /// keeps its 08:00–17:00 schedule identical on UTC CI and Europe/Berlin,
+    /// without mutating process-wide TZ in parallel tests or hard-coding DST.
+    fn fixture_local_utc(local: &str) -> chrono::DateTime<Utc> {
+        NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M")
+            .unwrap()
+            .and_local_timezone(Local)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn fixture_local_time(day: NaiveDate, time: &str) -> chrono::DateTime<Utc> {
+        fixture_local_utc(&format!("{} {time}", day.format("%Y-%m-%d")))
+    }
 
     async fn dense_day_app(count: usize, all_day: bool) -> App {
         let backend = crate::backend::MockBackend::seeded();
@@ -3309,44 +3328,36 @@ mod tests {
         let schedule = [
             (
                 "Maxim Granitskiy-Vacation",
-                "2026-08-16T22:00:00Z",
-                "2026-08-31T21:59:00Z",
+                "2026-08-16 00:00",
+                "2026-08-31 23:59",
             ),
             (
                 "Sven Olde Daalhuis-Homeoffice",
-                "2026-08-27T06:00:00Z",
-                "2026-08-27T15:00:00Z",
+                "2026-08-27 08:00",
+                "2026-08-27 17:00",
             ),
             (
                 "QNAP Festplatte Dima Disk 1",
-                "2026-08-27T07:00:00Z",
-                "2026-08-27T07:30:00Z",
+                "2026-08-27 09:00",
+                "2026-08-27 09:30",
             ),
-            (
-                "Dev Stand-up",
-                "2026-08-27T07:45:00Z",
-                "2026-08-27T08:00:00Z",
-            ),
-            (
-                "Veronica - Music",
-                "2026-08-27T10:30:00Z",
-                "2026-08-27T11:30:00Z",
-            ),
+            ("Dev Stand-up", "2026-08-27 09:45", "2026-08-27 10:00"),
+            ("Veronica - Music", "2026-08-27 12:30", "2026-08-27 13:30"),
             (
                 "Service Review: Tickets in Jira (Cloudvoid and Bestex)",
-                "2026-08-27T13:45:00Z",
-                "2026-08-27T14:00:00Z",
+                "2026-08-27 15:45",
+                "2026-08-27 16:00",
             ),
             (
                 "Service Review: Cloudvoid (ConnectWise tickets)",
-                "2026-08-27T14:00:00Z",
-                "2026-08-27T14:15:00Z",
+                "2026-08-27 16:00",
+                "2026-08-27 16:15",
             ),
         ];
         for (event, (title, start, end)) in app.snapshot.events.iter_mut().zip(schedule) {
             event.title = title.into();
-            event.start = start.parse().unwrap();
-            event.end = end.parse().unwrap();
+            event.start = fixture_local_utc(start);
+            event.end = fixture_local_utc(end);
         }
         let mut all_day = app.snapshot.events[0].clone();
         all_day.id = "sommerferien".into();
@@ -3714,24 +3725,25 @@ mod tests {
     async fn day_timeline_assigns_geometry_to_every_event_in_a_dense_schedule() {
         let mut app = dense_day_app(10, false).await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
-        // These UTC times are the requested 08:00–18:00 schedule in the
-        // local Europe/Berlin test environment.  The maximum concurrency is
+        // These are explicit 08:00–18:00 local wall-clock times. The fixture
+        // derives provider instants through the renderer's local zone, so UTC
+        // CI sees the same local schedule. The maximum concurrency is
         // two, so every event must fit in the day timeline without clipping.
         let schedule = [
-            ("06:00", "07:00"),
-            ("06:30", "08:00"),
-            ("07:00", "09:00"),
-            ("08:00", "10:00"),
+            ("08:00", "09:00"),
+            ("08:30", "10:00"),
             ("09:00", "11:00"),
-            ("10:30", "12:00"),
+            ("10:00", "12:00"),
             ("11:00", "13:00"),
-            ("13:00", "14:00"),
-            ("14:00", "15:00"),
+            ("12:30", "14:00"),
+            ("13:00", "15:00"),
             ("15:00", "16:00"),
+            ("16:00", "17:00"),
+            ("17:00", "18:00"),
         ];
         for (event, (start, end)) in app.snapshot.events.iter_mut().zip(schedule) {
-            event.start = format!("2026-08-27T{start}:00Z").parse().unwrap();
-            event.end = format!("2026-08-27T{end}:00Z").parse().unwrap();
+            event.start = fixture_local_time(day, start);
+            event.end = fixture_local_time(day, end);
         }
         app.active_date = day;
         app.view = View::Day;
@@ -3779,17 +3791,17 @@ mod tests {
         let mut app = dense_day_app(7, false).await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
         let schedule = [
-            ("2026-08-16T22:00:00Z", "2026-08-31T21:59:00Z"),
-            ("2026-08-27T06:00:00Z", "2026-08-27T07:00:00Z"),
-            ("2026-08-27T06:30:00Z", "2026-08-27T08:00:00Z"),
-            ("2026-08-27T08:00:00Z", "2026-08-27T09:00:00Z"),
-            ("2026-08-27T10:30:00Z", "2026-08-27T12:00:00Z"),
-            ("2026-08-27T11:00:00Z", "2026-08-27T13:00:00Z"),
-            ("2026-08-27T13:00:00Z", "2026-08-27T14:00:00Z"),
+            ("2026-08-16 00:00", "2026-08-31 23:59"),
+            ("2026-08-27 08:00", "2026-08-27 09:00"),
+            ("2026-08-27 08:30", "2026-08-27 10:00"),
+            ("2026-08-27 10:00", "2026-08-27 11:00"),
+            ("2026-08-27 12:30", "2026-08-27 14:00"),
+            ("2026-08-27 13:00", "2026-08-27 15:00"),
+            ("2026-08-27 15:00", "2026-08-27 16:00"),
         ];
         for (event, (start, end)) in app.snapshot.events.iter_mut().zip(schedule) {
-            event.start = start.parse().unwrap();
-            event.end = end.parse().unwrap();
+            event.start = fixture_local_utc(start);
+            event.end = fixture_local_utc(end);
         }
         app.snapshot.events[0].id = "multiday-background".into();
         app.active_date = day;
@@ -3843,10 +3855,10 @@ mod tests {
     async fn one_row_timeline_events_keep_an_identifying_label() {
         let mut app = dense_day_app(2, false).await;
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
-        app.snapshot.events[0].start = "2026-08-16T22:00:00Z".parse().unwrap();
-        app.snapshot.events[0].end = "2026-08-31T21:59:00Z".parse().unwrap();
-        app.snapshot.events[1].start = "2026-08-27T07:45:00Z".parse().unwrap();
-        app.snapshot.events[1].end = "2026-08-27T08:00:00Z".parse().unwrap();
+        app.snapshot.events[0].start = fixture_local_utc("2026-08-16 00:00");
+        app.snapshot.events[0].end = fixture_local_utc("2026-08-31 23:59");
+        app.snapshot.events[1].start = fixture_local_utc("2026-08-27 09:45");
+        app.snapshot.events[1].end = fixture_local_utc("2026-08-27 10:00");
         app.active_date = day;
         app.view = View::Day;
 
@@ -4384,6 +4396,33 @@ mod tests {
             rendered(&short_terminal).contains(selected_title),
             "the existing stateful agenda list must scroll to the selected event"
         );
+    }
+
+    #[tokio::test]
+    async fn month_and_agenda_titles_follow_active_date_not_a_long_event_start() {
+        let mut app = august_27_mixed_event_app().await;
+        let long_event = app
+            .snapshot
+            .events
+            .iter_mut()
+            .find(|event| event.title == "Maxim Granitskiy-Vacation")
+            .unwrap();
+        long_event.start = fixture_local_utc("2026-07-20 00:00");
+        long_event.end = fixture_local_utc("2026-09-02 23:59");
+        app.active_date = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+
+        app.view = View::Agenda;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let agenda = rendered(&terminal);
+        assert!(agenda.contains("Agenda from August 27, 2026"), "{agenda:?}");
+        assert!(!agenda.contains("Agenda from July 20, 2026"), "{agenda:?}");
+
+        app.view = View::Month;
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let month = rendered(&terminal);
+        assert!(month.contains("August 2026"), "{month:?}");
+        assert!(!month.contains("July 2026"), "{month:?}");
     }
 
     #[tokio::test]

@@ -96,7 +96,6 @@ pub struct ModalFrame {
 struct SelectionContext {
     active_date: NaiveDate,
     selected_event_id: Option<String>,
-    selected_event_date: Option<NaiveDate>,
 }
 
 /// The stable occurrence that owns a short-lived Details/editor workflow.
@@ -491,11 +490,15 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, snapshot: Snapshot) -> Self {
+        Self::new_at(config, snapshot, Local::now().date_naive())
+    }
+
+    fn new_at(config: Config, snapshot: Snapshot, active_date: NaiveDate) -> Self {
         let view = View::from_config(&config.default_view);
         Self {
             config,
             snapshot,
-            active_date: Local::now().date_naive(),
+            active_date,
             view,
             mode: Mode::Normal,
             modal_stack: vec![],
@@ -542,6 +545,11 @@ impl App {
             redo_stack: vec![],
             pending_history: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(config: Config, snapshot: Snapshot, active_date: NaiveDate) -> Self {
+        Self::new_at(config, snapshot, active_date)
     }
 
     /// Stages a reversible record when an event mutation enters the worker.
@@ -1494,7 +1502,6 @@ impl App {
         SelectionContext {
             active_date: self.active_date,
             selected_event_id: selected.map(|event| event.id.clone()),
-            selected_event_date: selected.map(Event::display_start_date),
         }
     }
 
@@ -1518,7 +1525,11 @@ impl App {
     }
 
     fn restore_selection_context(&mut self, context: SelectionContext) {
-        self.active_date = context.selected_event_date.unwrap_or(context.active_date);
+        // Calendar navigation and event focus are independent. A multi-day
+        // occurrence can be focused while its original start date is weeks
+        // earlier than the date currently being viewed; restoring that focus
+        // must never move Month or Agenda back to the occurrence's start.
+        self.active_date = context.active_date;
         if let Some(id) = context.selected_event_id {
             if !self.select_visible_event_id(&id) {
                 self.clear_event_selection();
@@ -3248,6 +3259,14 @@ impl App {
         self.restore_selection_context(context);
     }
 
+    fn go_to_today_at(&mut self, today: NaiveDate) -> WorkerCommand {
+        self.active_date = today;
+        self.clear_event_selection();
+        self.reset_timeline_viewport_if_needed();
+        self.close_all_modals();
+        WorkerCommand::EnsureRange(self.visible_range_request())
+    }
+
     fn selected_event_action(
         &mut self,
         action: impl FnOnce(String) -> UserAction,
@@ -3324,11 +3343,7 @@ impl App {
                 return Some(WorkerCommand::EnsureRange(self.visible_range_request()));
             }
             UserAction::Today => {
-                self.active_date = Local::now().date_naive();
-                self.clear_event_selection();
-                self.reset_timeline_viewport_if_needed();
-                self.close_all_modals();
-                return Some(WorkerCommand::EnsureRange(self.visible_range_request()));
+                return Some(self.go_to_today_at(Local::now().date_naive()));
             }
             UserAction::ChangeView(view) => {
                 self.set_view(view);
@@ -10228,6 +10243,86 @@ mod tests {
         let _ = app.execute_action(UserAction::ChangeView(View::Week));
         assert_eq!(app.timeline_start_minute, 11 * 60);
         assert_eq!(app.timeline_viewport_owner, TimelineViewportOwner::Manual);
+    }
+
+    #[tokio::test]
+    async fn startup_and_refresh_keep_active_date_as_the_view_anchor() {
+        let (seed, _) = app_with_mock_events().await;
+        let today = NaiveDate::from_ymd_opt(2026, 8, 27).unwrap();
+        let mut long_running = seed.snapshot.events[0].clone();
+        long_running.id = "long-running-occurrence".into();
+        long_running.title = "July through September".into();
+        long_running.all_day = false;
+        long_running.all_day_start_date = None;
+        long_running.all_day_end_date_exclusive = None;
+        long_running.start = local_midnight(NaiveDate::from_ymd_opt(2026, 7, 20).unwrap());
+        long_running.end = local_midnight(NaiveDate::from_ymd_opt(2026, 9, 2).unwrap());
+        let mut other = long_running.clone();
+        other.id = "august-neighbour".into();
+        other.start = local_midnight(today) + Duration::hours(9);
+        other.end = other.start + Duration::hours(1);
+
+        let snapshot = Snapshot {
+            calendars: seed.snapshot.calendars.clone(),
+            events: vec![long_running.clone(), other.clone()],
+            authorization: AuthorizationStatus::FullAccess,
+            updated_at: Some(Utc::now()),
+        };
+        let mut app = App::new_for_test(Config::default(), snapshot, today);
+        assert_eq!(
+            app.active_date, today,
+            "fresh startup uses the injected local date"
+        );
+        assert!(app.select_visible_event_id(&long_running.id));
+
+        for view in [View::Week, View::Month, View::Agenda, View::Day] {
+            let _ = app.execute_action(UserAction::ChangeView(view));
+            assert_eq!(app.active_date, today, "{view:?} must keep its date anchor");
+            assert_eq!(
+                app.selected_event_ref().map(|event| event.id.as_str()),
+                Some(long_running.id.as_str()),
+                "{view:?} may retain focus, but focus must not replace the date anchor"
+            );
+        }
+
+        app.view = View::Month;
+        assert_eq!(app.active_date.month(), 8, "Month is August, not July");
+        app.view = View::Agenda;
+        assert_eq!(
+            app.view_date_range().0,
+            today,
+            "Agenda begins at active_date rather than the event source start"
+        );
+
+        let mut reordered = app.snapshot.clone();
+        reordered.events.reverse();
+        app.apply_update(WorkerUpdate::Snapshot(reordered));
+        assert_eq!(app.active_date, today);
+        assert_eq!(
+            app.selected_event_ref().map(|event| event.id.as_str()),
+            Some(long_running.id.as_str())
+        );
+
+        app.apply_update(WorkerUpdate::Snapshot(Snapshot {
+            calendars: app.snapshot.calendars.clone(),
+            events: vec![other],
+            authorization: AuthorizationStatus::FullAccess,
+            updated_at: Some(Utc::now()),
+        }));
+        assert_eq!(
+            app.active_date, today,
+            "removing focus cannot move the date"
+        );
+        assert!(app.selected_event_ref().is_none());
+
+        let _ = app.go_to_today_at(today);
+        for view in [View::Day, View::Week, View::Month, View::Agenda] {
+            app.set_view(view);
+            assert_eq!(
+                app.active_date, today,
+                "Today anchors {view:?} deterministically"
+            );
+        }
     }
 
     #[tokio::test]
