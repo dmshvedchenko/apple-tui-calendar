@@ -953,7 +953,9 @@ fn footer_hint(app: &App) -> String {
             View::Month => {
                 "h/l day · j/k week · Tab event · n new · / search · : commands · ? help".into()
             }
-            View::Agenda => "j/k select · h/l date · n new · / search · : commands · ? help".into(),
+            View::Agenda => {
+                "j/k select · h/l date · . today · n new · / search · : commands · ? help".into()
+            }
         },
         Mode::Calendars => "j/k calendar · Space visibility · c / Esc return · ? help".into(),
         Mode::Details => {
@@ -2319,9 +2321,10 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
     let mut items = Vec::new();
     let debug_ui = std::env::var_os("TUI_CALENDAR_DEBUG_UI").is_some();
     let mut grouped_rows = 0usize;
-    let mut event_list_indices = Vec::with_capacity(events.len());
-    for (event_index, event) in events.iter().enumerate() {
-        let date = agenda_display_date(event, app.active_date);
+    let mut event_list_indices = vec![None; events.len()];
+    let end_date = app.view_range().1.with_timezone(&Local).date_naive();
+    for (date, event_index) in agenda_event_rows(&events, app.active_date, end_date) {
+        let event = events[event_index];
         if previous_date != Some(date) {
             let relative = match date.signed_duration_since(today).num_days() {
                 0 => "Today".to_owned(),
@@ -2345,7 +2348,7 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
         }
         let calendar = app.calendar(&event.calendar_id);
         let row_index = items.len();
-        event_list_indices.push(row_index);
+        event_list_indices[event_index].get_or_insert(row_index);
         if debug_ui {
             eprintln!(
                 "agenda row={} type=event date={} event_index={} event_id={:?} title={:?} selected={}",
@@ -2361,6 +2364,8 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 if event.all_day {
                     "  All day  ".to_owned()
+                } else if event.display_start_date() < date {
+                    "  ↳ cont.  ".to_owned()
                 } else {
                     format!(
                         "  {:<9}",
@@ -2396,18 +2401,22 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     let viewport_rows = block.inner(area).height;
+    let total_rows = items.len();
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(Color::Rgb(42, 47, 58)))
         .highlight_symbol("▶");
-    let selected_list_index = event_list_indices.get(app.selected_event).copied();
+    let selected_list_index = event_list_indices
+        .get(app.selected_event)
+        .copied()
+        .flatten();
     let mut state = ListState::default().with_selected(selected_list_index);
     if debug_ui {
         eprintln!(
             "agenda state: selected_event={} selected_list_index={selected_list_index:?} offset_before={} total_rows={} viewport_rows={}",
             app.selected_event,
             state.offset(),
-            event_list_indices.len() + grouped_rows,
+            total_rows,
             viewport_rows,
         );
     }
@@ -2417,11 +2426,44 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Agenda is a forward-looking view. An event that began before its first
-/// visible day but still intersects it belongs under that first day, rather
-/// than in an off-screen historical date group.
-fn agenda_display_date(event: &Event, first_visible_date: chrono::NaiveDate) -> chrono::NaiveDate {
-    event.display_start_date().max(first_visible_date)
+/// Each overlapping local date gets a presentation row, retaining the index
+/// of the original concrete occurrence for selection and actions. Dates are
+/// advanced as calendar dates; local midnights may be 23 or 25 hours apart.
+fn agenda_event_rows(
+    events: &[&Event],
+    first_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Vec<(chrono::NaiveDate, usize)> {
+    let mut rows = Vec::new();
+    let mut date = first_date;
+    while date < end_date {
+        let next = date
+            .succ_opt()
+            .expect("visible calendar date has a successor");
+        let boundaries = date
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .zip(
+                next.and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(Local)
+                    .earliest(),
+            );
+        for (index, event) in events.iter().enumerate() {
+            let overlaps = if event.all_day_date_range().is_some() {
+                event.all_day_intersects_dates(date, next)
+            } else {
+                boundaries.is_some_and(|(start, end)| event.start < end && event.end > start)
+            };
+            if overlaps {
+                rows.push((date, index));
+            }
+        }
+        date = next;
+    }
+    rows
 }
 
 fn draw_calendar_delete_confirm(frame: &mut Frame, app: &App) {
@@ -3037,7 +3079,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("Month: h/l or ←/→ day · j/k or ↑/↓ week · Tab event"),
         Line::from("Week: h/l or ←/→ day · j/k week"),
         Line::from(format!(
-            "{}            Today",
+            "{}            Today (. also in Agenda)",
             PaletteCommand::Today.key_hint()
         )),
         Line::from(format!(
@@ -4362,6 +4404,153 @@ mod tests {
             "a long event continuing below a compact viewport needs a cue: {contents:?}"
         );
         assert!(!contents.contains("Dev Stand-uptte Dima Disk 1"));
+    }
+
+    #[tokio::test]
+    async fn agenda_daily_rows_preserve_spans_and_simultaneous_occurrences_through_cache() {
+        let mut app = dense_day_app(1, false).await;
+        let template = app.snapshot.events[0].clone();
+        let anchor = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let tomorrow = anchor.succ_opt().unwrap();
+        let specifications = [
+            (
+                "span",
+                "Dmitriy Homeoffice",
+                "2026-09-28 08:07",
+                "2026-09-29 18:07",
+            ),
+            (
+                "sven",
+                "Sven Homeoffice",
+                "2026-09-29 08:00",
+                "2026-09-29 17:00",
+            ),
+            (
+                "rec-mon",
+                "Recurring homeoffice",
+                "2026-09-28 08:00",
+                "2026-09-28 17:00",
+            ),
+            (
+                "rec-tue",
+                "Recurring homeoffice",
+                "2026-09-29 08:00",
+                "2026-09-29 17:00",
+            ),
+            (
+                "standup",
+                "Dev Stand-up",
+                "2026-09-29 09:45",
+                "2026-09-29 10:00",
+            ),
+            (
+                "weekly",
+                "Weekly Update",
+                "2026-09-29 10:30",
+                "2026-09-29 11:00",
+            ),
+            (
+                "biweekly",
+                "2 weekly Meeting",
+                "2026-09-29 11:45",
+                "2026-09-29 12:15",
+            ),
+            (
+                "lesson",
+                "Veronica Lesson",
+                "2026-09-29 16:15",
+                "2026-09-29 18:30",
+            ),
+            (
+                "dance",
+                "Veronica Dance",
+                "2026-09-29 18:00",
+                "2026-09-29 19:00",
+            ),
+        ];
+        app.snapshot.events = specifications
+            .iter()
+            .map(|(id, title, start, end)| {
+                let mut event = template.clone();
+                event.id = (*id).into();
+                event.title = (*title).into();
+                event.start = fixture_local_utc(start);
+                event.end = fixture_local_utc(end);
+                event.has_recurrence = id.starts_with("rec-") || *id == "sven";
+                event
+            })
+            .collect();
+        app.view = View::Agenda;
+        app.active_date = anchor;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::cache::Cache::open(directory.path().join("agenda.sqlite3")).unwrap();
+        cache.save_calendars(&app.snapshot.calendars).unwrap();
+        let (start, end) = app.view_range();
+        cache
+            .replace_events(start, end, &app.snapshot.events)
+            .unwrap();
+        assert_eq!(
+            cache.load_snapshot().unwrap().events.len(),
+            specifications.len()
+        );
+        for selected_id in ["span", "sven", "rec-tue"] {
+            app.selected_event = app
+                .visible_events()
+                .iter()
+                .position(|event| event.id == selected_id)
+                .unwrap();
+            let mut snapshot = cache.load_snapshot().unwrap();
+            snapshot.events.reverse();
+            app.apply_update(crate::app::WorkerUpdate::Snapshot(snapshot));
+            assert_eq!(app.selected_event_ref().unwrap().id, selected_id);
+        }
+        let visible = app.visible_events();
+        let rows = agenda_event_rows(&visible, anchor, tomorrow.succ_opt().unwrap());
+        let tuesday_ids = rows
+            .iter()
+            .filter(|(date, _)| *date == tomorrow)
+            .map(|(_, index)| visible[*index].id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tuesday_ids.len(), 8);
+        for id in [
+            "span", "sven", "rec-tue", "standup", "weekly", "biweekly", "lesson", "dance",
+        ] {
+            assert!(tuesday_ids.contains(&id), "missing {id}");
+        }
+        assert!(
+            rows.iter()
+                .any(|(date, index)| *date == anchor && visible[*index].id == "rec-mon")
+        );
+        app.selected_event = usize::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).unwrap();
+        terminal
+            .draw(|frame| draw_agenda(frame, &app, frame.area()))
+            .unwrap();
+        let output = rendered(&terminal);
+        assert_eq!(output.matches("Dmitriy Homeoffice").count(), 2);
+        assert!(output.contains("Sven Homeoffice"));
+        assert!(output.contains("↳ cont."));
+    }
+
+    #[tokio::test]
+    async fn agenda_overlap_rows_use_exclusive_midnight_and_dst_calendar_dates() {
+        let app = dense_day_app(1, false).await;
+        for (first, last) in [("2026-03-28", "2026-03-30"), ("2026-10-24", "2026-10-26")] {
+            let date = NaiveDate::parse_from_str(first, "%Y-%m-%d").unwrap();
+            let end = NaiveDate::parse_from_str(last, "%Y-%m-%d").unwrap();
+            let mut event = app.snapshot.events[0].clone();
+            event.start = fixture_local_time(date, "23:00");
+            event.end = fixture_local_time(end, "00:00");
+            let rows = agenda_event_rows(&[&event], date, end.succ_opt().unwrap());
+            assert_eq!(rows, vec![(date, 0), (date.succ_opt().unwrap(), 0)]);
+            event.all_day = true;
+            event.all_day_start_date = Some(date);
+            event.all_day_end_date_exclusive = Some(end);
+            assert_eq!(
+                agenda_event_rows(&[&event], date, end.succ_opt().unwrap()),
+                rows
+            );
+        }
     }
 
     #[tokio::test]

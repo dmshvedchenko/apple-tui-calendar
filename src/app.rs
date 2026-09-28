@@ -1824,6 +1824,9 @@ impl App {
             KeyCode::PageDown => self.scroll_timeline(120),
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('t') => return self.execute_action(UserAction::Today),
+            KeyCode::Char('.') if matches!(self.view, View::Agenda) => {
+                return self.execute_action(UserAction::Today);
+            }
             KeyCode::Char('c') => {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.mode = if self.sidebar_visible {
@@ -3260,8 +3263,14 @@ impl App {
     }
 
     fn go_to_today_at(&mut self, today: NaiveDate) -> WorkerCommand {
+        let mut context = self.selection_context();
+        context.active_date = today;
         self.active_date = today;
-        self.clear_event_selection();
+        if matches!(self.view, View::Agenda) {
+            self.restore_selection_context(context);
+        } else {
+            self.clear_event_selection();
+        }
         self.reset_timeline_viewport_if_needed();
         self.close_all_modals();
         WorkerCommand::EnsureRange(self.visible_range_request())
@@ -6427,6 +6436,47 @@ async fn synchronize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agenda_today_preserves_only_representable_identity_and_dot_is_view_specific() {
+        let (mut app, _) = app_with_mock_events().await;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let mut past = app.snapshot.events[0].clone();
+        past.id = "past".into();
+        past.all_day = false;
+        past.start = local_midnight(today - Duration::days(2));
+        past.end = local_midnight(today - Duration::days(1));
+        let mut ongoing = past.clone();
+        ongoing.id = "ongoing".into();
+        ongoing.end = local_midnight(today + Duration::days(2));
+        app.snapshot.events = vec![past, ongoing];
+        app.view = View::Agenda;
+        for id in ["ongoing", "past"] {
+            app.active_date = today - Duration::days(3);
+            assert!(app.select_visible_event_id(id));
+            app.go_to_today_at(today);
+            assert_eq!(app.active_date, today);
+            assert_eq!(
+                app.selected_event_ref().map(|event| event.id.as_str()),
+                (id == "ongoing").then_some("ongoing")
+            );
+        }
+        let local_today = Local::now().date_naive();
+        for offset in [-30, 30] {
+            app.active_date = local_today + Duration::days(offset);
+            assert!(matches!(
+                app.handle_key(key('.')),
+                Some(WorkerCommand::EnsureRange(_))
+            ));
+            assert_eq!(app.active_date, local_today);
+        }
+        for view in [View::Day, View::Week, View::Month] {
+            app.view = view;
+            app.active_date = today;
+            assert!(app.handle_key(key('.')).is_none());
+            assert_eq!(app.active_date, today);
+        }
+    }
 
     async fn app_with_mock_events() -> (App, crate::backend::MockBackend) {
         let backend = crate::backend::MockBackend::seeded();

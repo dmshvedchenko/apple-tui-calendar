@@ -9,10 +9,15 @@
 | `h` / `l`, `←` / `→` | Previous / next calendar day |
 | `H` / `L` | Previous / next view period |
 | `gg` / `t` | Jump to today |
+| Agenda: `.` | Jump to today; retain focus only if the same occurrence remains visible |
 | `gd` | Day view |
 | `gw` | Week view |
 | `gm` | Month view |
 | `ga` | Agenda view |
+
+Agenda lists multi-day events on every overlapping local date. Continuation
+rows show `↳ cont.` and retain the original occurrence identity; selecting an
+event scrolls to its first visible row. Simultaneous events remain independent.
 
 ### Month view
 
