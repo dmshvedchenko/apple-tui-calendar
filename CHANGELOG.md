@@ -3,6 +3,20 @@
 All notable user-facing changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.3 — 2026-09-28
+
+### Fixed
+
+- In Agenda, `.` now returns to today's local date through the existing Today
+  action. Selection is restored by stable event ID when still visible, and
+  cleared safely otherwise.
+- Agenda lists multi-day timed events under every overlapping local day.
+  Continuation rows use `↳ cont.` and preserve the original concrete event
+  identity, keeping simultaneous events independently selectable.
+- Added regression coverage for simultaneous events, consecutive recurring
+  occurrences, cache persistence, reordered snapshots, exclusive-midnight
+  handling, DST, buffer rendering, and Today navigation.
+
 ## 1.0.2 — 2026-08-25
 
 ### Fixed
