@@ -3,6 +3,18 @@
 All notable user-facing changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.4 — 2026-09-29
+
+### Fixed
+
+- Restored `t` as the canonical Today shortcut in Day, Week, Month, and Agenda.
+- Removed the temporary Agenda-only `.` alias so the key behaves consistently
+  across all calendar views.
+- Today navigation now preserves the selected occurrence by stable event ID
+  when it remains visible and safely clears focus otherwise.
+- Added deterministic cross-view regression coverage for Today navigation and
+  text-input handling.
+
 ## 1.0.3 — 2026-09-28
 
 ### Fixed
