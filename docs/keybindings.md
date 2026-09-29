@@ -9,7 +9,6 @@
 | `h` / `l`, `←` / `→` | Previous / next calendar day |
 | `H` / `L` | Previous / next view period |
 | `gg` / `t` | Jump to today |
-| Agenda: `.` | Jump to today; retain focus only if the same occurrence remains visible |
 | `gd` | Day view |
 | `gw` | Week view |
 | `gm` | Month view |

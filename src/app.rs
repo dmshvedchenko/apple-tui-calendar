@@ -1599,6 +1599,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<WorkerCommand> {
+        self.handle_key_at(key, Local::now().date_naive())
+    }
+
+    fn handle_key_at(&mut self, key: KeyEvent, today: NaiveDate) -> Option<WorkerCommand> {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return None;
         }
@@ -1611,7 +1615,7 @@ impl App {
             return None;
         }
         match self.mode {
-            Mode::Normal => self.handle_normal(key),
+            Mode::Normal => self.handle_normal(key, today),
             Mode::Calendars => self.handle_calendars(key),
             Mode::CalendarManager => self.handle_calendar_manager(key),
             Mode::CalendarManagerDetails => self.handle_calendar_manager_details(key),
@@ -1733,12 +1737,12 @@ impl App {
         }
     }
 
-    fn handle_normal(&mut self, key: KeyEvent) -> Option<WorkerCommand> {
+    fn handle_normal(&mut self, key: KeyEvent, today: NaiveDate) -> Option<WorkerCommand> {
         if self.pending_g {
             self.pending_g = false;
             match key.code {
                 KeyCode::Char('g') => {
-                    return self.execute_action(UserAction::Today);
+                    return self.execute_action_at(UserAction::Today, today);
                 }
                 KeyCode::Char('d') => {
                     return self.execute_action(UserAction::ChangeView(View::Day));
@@ -1823,10 +1827,7 @@ impl App {
             KeyCode::PageUp => self.scroll_timeline(-120),
             KeyCode::PageDown => self.scroll_timeline(120),
             KeyCode::Char('g') => self.pending_g = true,
-            KeyCode::Char('t') => return self.execute_action(UserAction::Today),
-            KeyCode::Char('.') if matches!(self.view, View::Agenda) => {
-                return self.execute_action(UserAction::Today);
-            }
+            KeyCode::Char('t') => return self.execute_action_at(UserAction::Today, today),
             KeyCode::Char('c') => {
                 self.sidebar_visible = !self.sidebar_visible;
                 self.mode = if self.sidebar_visible {
@@ -3266,11 +3267,7 @@ impl App {
         let mut context = self.selection_context();
         context.active_date = today;
         self.active_date = today;
-        if matches!(self.view, View::Agenda) {
-            self.restore_selection_context(context);
-        } else {
-            self.clear_event_selection();
-        }
+        self.restore_selection_context(context);
         self.reset_timeline_viewport_if_needed();
         self.close_all_modals();
         WorkerCommand::EnsureRange(self.visible_range_request())
@@ -3311,6 +3308,10 @@ impl App {
     }
 
     pub fn execute_action(&mut self, action: UserAction) -> Option<WorkerCommand> {
+        self.execute_action_at(action, Local::now().date_naive())
+    }
+
+    fn execute_action_at(&mut self, action: UserAction, today: NaiveDate) -> Option<WorkerCommand> {
         match action {
             UserAction::CreateEvent => self.begin_new_form(),
             UserAction::QuickAdd => self.begin_quick_add(),
@@ -3352,7 +3353,7 @@ impl App {
                 return Some(WorkerCommand::EnsureRange(self.visible_range_request()));
             }
             UserAction::Today => {
-                return Some(self.go_to_today_at(Local::now().date_naive()));
+                return Some(self.go_to_today_at(today));
             }
             UserAction::ChangeView(view) => {
                 self.set_view(view);
@@ -6438,44 +6439,66 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn agenda_today_preserves_only_representable_identity_and_dot_is_view_specific() {
+    async fn t_is_the_only_today_shortcut_and_preserves_only_representable_identity() {
         let (mut app, _) = app_with_mock_events().await;
         let today = NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        let historical = today - Duration::days(40);
         let mut past = app.snapshot.events[0].clone();
         past.id = "past".into();
         past.all_day = false;
-        past.start = local_midnight(today - Duration::days(2));
-        past.end = local_midnight(today - Duration::days(1));
+        past.start = local_midnight(historical);
+        past.end = local_midnight(historical + Duration::days(1));
         let mut ongoing = past.clone();
         ongoing.id = "ongoing".into();
         ongoing.end = local_midnight(today + Duration::days(2));
         app.snapshot.events = vec![past, ongoing];
-        app.view = View::Agenda;
-        for id in ["ongoing", "past"] {
-            app.active_date = today - Duration::days(3);
-            assert!(app.select_visible_event_id(id));
-            app.go_to_today_at(today);
-            assert_eq!(app.active_date, today);
-            assert_eq!(
-                app.selected_event_ref().map(|event| event.id.as_str()),
-                (id == "ongoing").then_some("ongoing")
-            );
-        }
-        let local_today = Local::now().date_naive();
-        for offset in [-30, 30] {
-            app.active_date = local_today + Duration::days(offset);
+        for view in [View::Day, View::Week, View::Month, View::Agenda] {
+            app.view = view;
+            app.active_date = historical;
+            app.clear_event_selection();
             assert!(matches!(
-                app.handle_key(key('.')),
+                app.handle_key_at(key('t'), today),
                 Some(WorkerCommand::EnsureRange(_))
             ));
-            assert_eq!(app.active_date, local_today);
-        }
-        for view in [View::Day, View::Week, View::Month] {
-            app.view = view;
-            app.active_date = today;
-            assert!(app.handle_key(key('.')).is_none());
             assert_eq!(app.active_date, today);
         }
+
+        for view in [View::Day, View::Week, View::Month, View::Agenda] {
+            for id in ["ongoing", "past"] {
+                app.view = view;
+                app.active_date = historical;
+                assert!(app.select_visible_event_id(id));
+                assert!(matches!(
+                    app.handle_key_at(key('t'), today),
+                    Some(WorkerCommand::EnsureRange(_))
+                ));
+                assert_eq!(app.active_date, today);
+                assert_eq!(
+                    app.selected_event_ref().map(|event| event.id.as_str()),
+                    (id == "ongoing").then_some("ongoing"),
+                    "{view:?} must restore only the same representable event"
+                );
+            }
+        }
+
+        for view in [View::Day, View::Week, View::Month, View::Agenda] {
+            app.view = view;
+            app.active_date = historical;
+            assert!(app.handle_key_at(key('.'), today).is_none());
+            assert_eq!(app.active_date, historical);
+        }
+
+        app.mode = Mode::Search;
+        app.search_query.clear();
+        assert!(app.handle_key_at(key('t'), today).is_none());
+        assert_eq!(app.search_query, "t");
+        assert_eq!(app.active_date, historical);
+
+        app.mode = Mode::QuickAdd;
+        app.quick_add_input.clear();
+        assert!(app.handle_key_at(key('t'), today).is_none());
+        assert_eq!(app.quick_add_input, "t");
+        assert_eq!(app.active_date, historical);
     }
 
     async fn app_with_mock_events() -> (App, crate::backend::MockBackend) {

@@ -954,7 +954,7 @@ fn footer_hint(app: &App) -> String {
                 "h/l day · j/k week · Tab event · n new · / search · : commands · ? help".into()
             }
             View::Agenda => {
-                "j/k select · h/l date · . today · n new · / search · : commands · ? help".into()
+                "j/k select · h/l date · t today · n new · / search · : commands · ? help".into()
             }
         },
         Mode::Calendars => "j/k calendar · Space visibility · c / Esc return · ? help".into(),
@@ -3079,7 +3079,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("Month: h/l or ←/→ day · j/k or ↑/↓ week · Tab event"),
         Line::from("Week: h/l or ←/→ day · j/k week"),
         Line::from(format!(
-            "{}            Today (. also in Agenda)",
+            "{}            Today",
             PaletteCommand::Today.key_hint()
         )),
         Line::from(format!(
