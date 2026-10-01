@@ -442,6 +442,8 @@ pub struct App {
     pub mode: Mode,
     pub modal_stack: Vec<ModalFrame>,
     pub selected_event: usize,
+    /// Today owns Agenda's first viewport until the next explicit navigation.
+    pub agenda_today_anchor: bool,
     pub selected_calendar: usize,
     pub calendar_capabilities: CalendarCapabilities,
     pub calendar_sources: Vec<CalendarSource>,
@@ -503,6 +505,7 @@ impl App {
             mode: Mode::Normal,
             modal_stack: vec![],
             selected_event: 0,
+            agenda_today_anchor: false,
             selected_calendar: 0,
             calendar_capabilities: CalendarCapabilities::default(),
             calendar_sources: vec![],
@@ -1685,6 +1688,7 @@ impl App {
                 // occurrence before a drag is considered. A read-only event
                 // can therefore still be selected even when dragging it is
                 // correctly rejected below.
+                self.agenda_today_anchor = false;
                 self.select_visible_event_id(&event_id);
                 self.start_drag_session(
                     event_id.clone(),
@@ -3195,6 +3199,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        self.agenda_today_anchor = false;
         let count = self.visible_events().len();
         if count == 0 {
             self.clear_event_selection();
@@ -3235,12 +3240,14 @@ impl App {
     }
 
     fn navigate_date(&mut self, direction: i32) {
+        self.agenda_today_anchor = false;
         self.active_date += Duration::days(direction as i64);
         self.clear_event_selection();
         self.reset_timeline_viewport_if_needed();
     }
 
     fn navigate_period(&mut self, direction: i32) {
+        self.agenda_today_anchor = false;
         self.active_date = match self.view {
             View::Month if direction < 0 => self
                 .active_date
@@ -3258,19 +3265,34 @@ impl App {
     }
 
     fn set_view(&mut self, view: View) {
+        self.agenda_today_anchor = false;
         let context = self.selection_context();
         self.view = view;
         self.restore_selection_context(context);
     }
 
-    fn go_to_today_at(&mut self, today: NaiveDate) -> WorkerCommand {
+    pub(crate) fn go_to_today_at(&mut self, today: NaiveDate) -> WorkerCommand {
         let mut context = self.selection_context();
         context.active_date = today;
         self.active_date = today;
         self.restore_selection_context(context);
+        self.agenda_today_anchor = self.view == View::Agenda;
+        if self.agenda_today_anchor
+            && self
+                .selected_event_ref()
+                .is_some_and(|event| !event.occurs_on(today))
+        {
+            self.clear_event_selection();
+        }
         self.reset_timeline_viewport_if_needed();
         self.close_all_modals();
         WorkerCommand::EnsureRange(self.visible_range_request())
+    }
+
+    pub(crate) fn reanchor_agenda_selection(&mut self, selected_row: Option<usize>, rows: u16) {
+        if self.agenda_today_anchor && selected_row.is_some_and(|row| row >= usize::from(rows)) {
+            self.clear_event_selection();
+        }
     }
 
     fn selected_event_action(
@@ -3341,6 +3363,7 @@ impl App {
                 self.enter_modal(Mode::DateJump);
             }
             UserAction::GoToDate(date) => {
+                self.agenda_today_anchor = false;
                 self.active_date = date;
                 self.clear_event_selection();
                 self.reset_timeline_viewport_if_needed();
@@ -6437,6 +6460,33 @@ async fn synchronize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agenda_today_key_clears_future_focus_and_releases_anchor_on_navigation() {
+        let (mut app, _) = app_with_mock_events().await;
+        let today = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let mut future = app.snapshot.events[0].clone();
+        future.all_day = false;
+        future.start = local_midnight(today + Duration::days(20));
+        future.end = future.start + Duration::hours(1);
+        app.snapshot.events = vec![future];
+        app.view = View::Agenda;
+        for initial in [today - Duration::days(30), today + Duration::days(19)] {
+            app.active_date = initial;
+            app.selected_event = 0;
+            assert!(matches!(
+                app.handle_key_at(key('t'), today),
+                Some(WorkerCommand::EnsureRange(_))
+            ));
+            assert_eq!(app.active_date, today);
+            assert_eq!(app.view_date_range().0, today);
+            assert!(app.selected_event_ref().is_none());
+            assert!(app.agenda_today_anchor);
+        }
+        app.handle_key_at(key('j'), today);
+        assert!(!app.agenda_today_anchor);
+        assert!(app.selected_event_ref().is_some());
+    }
 
     #[tokio::test]
     async fn t_is_the_only_today_shortcut_and_preserves_only_representable_identity() {

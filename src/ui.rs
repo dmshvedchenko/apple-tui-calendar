@@ -322,10 +322,38 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Gives the application the actual Day/Week grid height before rendering.
+/// Gives the application the actual viewport height before rendering.
 /// This is intentionally the only layout-to-state bridge: it selects which
-/// rows are initially visible, while timeline rectangles remain pure geometry.
+/// rows are initially visible and clears Agenda focus that would defeat Today,
+/// while timeline rectangles remain pure geometry.
 pub fn sync_timeline_viewport(app: &mut App, frame_area: Rect) {
+    if app.view == View::Agenda && app.agenda_today_anchor {
+        let areas = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(frame_area);
+        let height = content_block(Line::default()).inner(areas[1]).height;
+        let events = app.visible_events();
+        let end = app.view_range().1.with_timezone(&Local).date_naive();
+        let mut previous = None;
+        let mut row = 0;
+        let mut selected_row = None;
+        for (date, index) in agenda_event_rows(&events, app.active_date, end) {
+            if previous != Some(date) {
+                row += 1;
+                previous = Some(date);
+            }
+            if index == app.selected_event {
+                selected_row = Some(row);
+                break;
+            }
+            row += 1;
+        }
+        app.reanchor_agenda_selection(selected_row, height);
+        return;
+    }
     if !matches!(app.view, View::Day | View::Week)
         || matches!(
             app.mode,
@@ -2409,7 +2437,8 @@ fn draw_agenda(frame: &mut Frame, app: &App, area: Rect) {
     let selected_list_index = event_list_indices
         .get(app.selected_event)
         .copied()
-        .flatten();
+        .flatten()
+        .filter(|row| !app.agenda_today_anchor || *row < usize::from(viewport_rows));
     let mut state = ListState::default().with_selected(selected_list_index);
     if debug_ui {
         eprintln!(
@@ -3362,6 +3391,59 @@ mod tests {
         );
         app.active_date = date;
         app
+    }
+
+    #[tokio::test]
+    async fn agenda_today_reanchors_the_rendered_list_and_retains_only_visible_focus() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let mut app = dense_day_app(30, false).await;
+        for (index, event) in app.snapshot.events.iter_mut().enumerate() {
+            event.start = fixture_local_utc("2026-10-01 09:00") + Duration::days(index as i64);
+            event.end = event.start + Duration::hours(1);
+            event.title = format!("October appointment {index}");
+        }
+        // A continuation belongs to Today's first section without changing ID.
+        app.snapshot.events[0].start -= Duration::days(2);
+        app.view = View::Agenda;
+        let area = Rect::new(0, 0, 120, 20);
+        for initial in [today - Duration::days(30), today + Duration::days(19)] {
+            app.active_date = initial;
+            app.selected_event = app
+                .visible_events()
+                .iter()
+                .position(|e| e.id == "dense-20")
+                .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            terminal
+                .draw(|frame| draw_agenda(frame, &app, area))
+                .unwrap();
+            assert!(!rendered(&terminal).contains("October appointment 0"));
+            app.go_to_today_at(today);
+            sync_timeline_viewport(&mut app, area);
+            assert_eq!(app.active_date, today);
+            assert!(app.selected_event_ref().is_none());
+            terminal
+                .draw(|frame| draw_agenda(frame, &app, area))
+                .unwrap();
+            let text = rendered(&terminal);
+            assert!(text.contains("Agenda from October 1, 2026"), "{text}");
+            assert!(text.contains("October appointment 0"), "{text}");
+            assert!(text.contains("↳ cont."), "{text}");
+        }
+        app.selected_event = 0;
+        app.go_to_today_at(today);
+        sync_timeline_viewport(&mut app, area);
+        assert_eq!(app.selected_event_ref().unwrap().id, "dense-0");
+
+        // Even a Today occurrence must not scroll away from the first section.
+        for event in &mut app.snapshot.events {
+            event.start = fixture_local_utc("2026-10-01 09:00");
+            event.end = event.start + Duration::hours(1);
+        }
+        app.selected_event = 29;
+        app.go_to_today_at(today);
+        sync_timeline_viewport(&mut app, area);
+        assert!(app.selected_event_ref().is_none());
     }
 
     async fn august_27_mixed_event_app() -> App {

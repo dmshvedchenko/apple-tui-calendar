@@ -14,6 +14,10 @@
 | `gm` | Month view |
 | `ga` | Agenda view |
 
+In Agenda, Today returns to the first section from today's date. Event focus
+is retained only when it fits in that first viewport; otherwise it is cleared.
+Further event navigation resumes ordinary scrolling.
+
 Agenda lists multi-day events on every overlapping local date. Continuation
 rows show `↳ cont.` and retain the original occurrence identity; selecting an
 event scrolls to its first visible row. Simultaneous events remain independent.
