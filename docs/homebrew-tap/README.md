@@ -32,15 +32,15 @@ tui-calendar
 
 ## Maintainer release update
 
-Update the canonical tap's existing `Formula/tui-calendar.rb` with the v1.0.4
+Update the canonical tap's existing `Formula/tui-calendar.rb` with the v1.0.5
 URL, version assertion, and published archive SHA-256. Preserve its wrapper,
 helper and IPC tests; the application repository formula is a template only.
 The immutable tag must exist before calculating the checksum:
 
 ```sh
-curl -fL -o v1.0.4.tar.gz \
-  https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.4.tar.gz
-shasum -a 256 v1.0.4.tar.gz
+curl -fL -o v1.0.5.tar.gz \
+  https://github.com/dmshvedchenko/apple-tui-calendar/archive/refs/tags/v1.0.5.tar.gz
+shasum -a 256 v1.0.5.tar.gz
 brew tap dmshvedchenko/tui-calendar
 brew audit --strict --formula dmshvedchenko/tui-calendar/tui-calendar
 ```

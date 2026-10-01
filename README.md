@@ -222,7 +222,7 @@ The UI never imports or links EventKit. One long-lived `EKEventStore` lives in t
 
 ## Homebrew
 
-Install the public `v1.0.4` release from the dedicated tap:
+Install the public `v1.0.5` release from the dedicated tap:
 
 ```sh
 brew tap dmshvedchenko/tui-calendar

@@ -3,6 +3,20 @@
 All notable user-facing changes are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.5 — 2026-10-01
+
+### Fixed
+
+- Fixed Agenda Today navigation so pressing `t` visibly anchors the viewport
+  at today's local date, preventing a previously selected future occurrence
+  from scrolling the list away from Today.
+- Today preserves stable event selection only when the occurrence belongs to
+  Today and fits within the initial viewport; otherwise focus is cleared safely.
+- Normal Agenda navigation resumes ordinary scrolling after the Today jump.
+- Added deterministic state and rendered-buffer regressions covering past and
+  future navigation anchors, future selection, visible Today selection,
+  continuation rows, dense Today overflow, and subsequent navigation.
+
 ## 1.0.4 — 2026-09-29
 
 ### Fixed
